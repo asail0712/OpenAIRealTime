@@ -89,11 +89,14 @@ public class OpenAIRealtimeUnity : MonoBehaviour
 
     // events
     public event Action<string> OnUserTranscriptDone;
+    public event Action<string> OnAssistantTextDelta;
     public event Action<string> OnAssistantTextDone;
     public event Action<byte[]> OnAssistantAudioDone;
 
     // response lifecycle (simple)
     private volatile bool _responseInFlight;
+
+    public bool IsMicOn { get => _streamingMic;}
 
     // ===============================
     // Unity lifecycle
@@ -462,6 +465,7 @@ public class OpenAIRealtimeUnity : MonoBehaviour
                 return;
 
             // --- Text stream ---
+            case "response.audio_transcript.delta":
             case "response.output_text.delta":
             case "response.text.delta":
                 {
@@ -470,8 +474,17 @@ public class OpenAIRealtimeUnity : MonoBehaviour
                     {
                         textBuilder.Append(d);
                     }
+                    
+                    string txt = textBuilder.ToString();
+                    if (!string.IsNullOrEmpty(txt))
+                    {
+                        OnAssistantTextDelta?.Invoke(txt);
+                    }
+                    Debug.Log($"ASSISTANT TEXT DELTA: {txt}");
+
                     return;
                 }
+            case "response.audio_transcript.done":
             case "response.output_text.done":
             case "response.text.done":
                 {
@@ -602,7 +615,7 @@ public class OpenAIRealtimeUnity : MonoBehaviour
     // Quick test action
     // ===============================
     [ContextMenu("Send Text Prompt")]
-    public async void SendTextPrompt()
+    public async Task SendTextAsync(string inst = "請隨機念出一首唐詩")
     {
         if (!_connected)
         {
@@ -615,7 +628,7 @@ public class OpenAIRealtimeUnity : MonoBehaviour
             response    = new
             {
                 modalities      = new[] { "text", "audio" },
-                instructions    = "請隨機念出一首唐詩"
+                instructions    = inst
             }
         };
 
