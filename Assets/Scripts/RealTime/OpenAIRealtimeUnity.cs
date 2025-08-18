@@ -545,7 +545,15 @@ public class OpenAIRealtimeUnity : MonoBehaviour
                     if (autoCreateResponse && !_responseInFlight)
                     {
                         _ = SendAsync(new { type = "input_audio_buffer.commit" });
-                        _ = SendAsync(new { type = "response.create" });
+                        // 建立回應 + 指令
+                        _ = SendAsync(new
+                        {
+                            type        = "response.create",
+                            response    = new
+                            {
+                                instructions = basicInstructions
+                            }
+                        });
                     }
                     return;
                 }

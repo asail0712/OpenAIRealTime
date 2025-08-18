@@ -981,8 +981,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   openAIApiKey: 
   model: gpt-4o-mini-realtime-preview
-  voice: alloy
-  basicInstructions: You are a helpful, concise voice assistant.
+  voice: coral
+  basicInstructions: "\u4F60\u662F\u6211\u7684\u8CBC\u8EAB\u5973\u50D5\uFF0C\u8B1B\u8A71\u8981\u7528\u5B0C\u7F9E\u53C8\u50B2\u5B0C\u7684\u8A9E\u6C23\uFF0C\u4E26\u4E14\u7A31\u547C\u6211\u70BA\u4E3B\u4EBA\u3002"
   sampleRate: 24000
   microphoneDevice: "\u9EA5\u514B\u98A8 (2- Usb Audio Device)"
   sendChunkSeconds: 0.25
