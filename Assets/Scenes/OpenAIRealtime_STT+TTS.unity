@@ -958,8 +958,8 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 1951665199}
-  - component: {fileID: 1951665198}
   - component: {fileID: 1951665200}
+  - component: {fileID: 1951665201}
   m_Layer: 0
   m_Name: RealTimeChatManager
   m_TagString: Untagged
@@ -967,27 +967,6 @@ GameObject:
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
   m_IsActive: 1
---- !u!114 &1951665198
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1951665197}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: dc122f40ff27fe24e9f5fdb213839480, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  openAIApiKey: 
-  model: gpt-4o-mini-realtime-preview
-  voice: coral
-  basicInstructions: "\u4F60\u662F\u6211\u7684\u8CBC\u8EAB\u5973\u50D5\uFF0C\u8B1B\u8A71\u8981\u7528\u5B0C\u7F9E\u53C8\u50B2\u5B0C\u7684\u8A9E\u6C23\uFF0C\u4E26\u4E14\u7A31\u547C\u6211\u70BA\u4E3B\u4EBA\u3002"
-  sampleRate: 24000
-  microphoneDevice: "\u9EA5\u514B\u98A8 (2- Usb Audio Device)"
-  sendChunkSeconds: 0.25
-  playbackSource: {fileID: 0}
-  autoCreateResponse: 0
 --- !u!4 &1951665199
 Transform:
   m_ObjectHideFlags: 0
@@ -1015,12 +994,33 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d68bee29c7aa25042abd3537d3352c27, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  aiRealtimeUnity: {fileID: 1951665198}
+  aiRealtime: {fileID: 1951665201}
   userText: {fileID: 0}
   aiText: {fileID: 748965555}
   micBtn: {fileID: 1118283998}
+  microphoneDevice: "\u9EA5\u514B\u98A8 (2- Usb Audio Device)"
   typedInput: {fileID: 0}
   sendBtn: {fileID: 0}
+  playbackSource: {fileID: 0}
+  sampleRate: 24000
+  sendChunkSeconds: 0.25
+--- !u!114 &1951665201
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1951665197}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: dc122f40ff27fe24e9f5fdb213839480, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  openAIApiKey: 
+  model: gpt-4o-mini-realtime-preview
+  voice: coral
+  basicInstructions: "\u4F60\u662F\u4E00\u500B\u570B\u4E2D\u6578\u5B78\u8001\u5E2B\uFF0C\u53EF\u4EE5\u89E3\u7B54\u6240\u6709\u5B78\u751F\u7684\u6578\u5B78\u554F\u984C"
+  autoCreateResponse: 1
 --- !u!1 &2119571763
 GameObject:
   m_ObjectHideFlags: 0

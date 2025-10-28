@@ -1,216 +1,356 @@
-﻿using System;
-using System.Collections.Generic;
+﻿using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using System;
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
-using Newtonsoft.Json.Linq; // 用 NuGet 或 Unity Package Manager 安裝 JSON.NET
 
+/// <summary>
+/// Refactored & trimmed version based on user's original file.
+/// Focus: clear responsibilities, minimal state, safe defaults, and readable flow.
+/// </summary>
 public class OpenAIRealtime : MonoBehaviour
 {
-    public string apiKey    = "sk-...";
-    public string model     = "gpt-4o-mini-realtime-preview";
-    public string voice     = "alloy";
-    public int sampleRate   = 24000;
-    public int channels     = 1;
+    // ===============================
+    // Config (Inspector)
+    // ===============================
+    [Header("OpenAI Settings")]
+    [Tooltip("Your OpenAI API key (sk-...) – store securely for production.")]
+    public string openAIApiKey = string.Empty;
 
-    private ClientWebSocket ws;
-    private CancellationTokenSource cts;
-    private FloatRingBuffer ring;
-    private AudioClip clip;
-    private AudioSource source;
-    private Action<string> finishAction;
-    private Queue<string> deltaMessage;
+    [Tooltip("Realtime model name. e.g. gpt-4o-mini-realtime-preview")]
+    public string model = "gpt-4o-mini-realtime-preview";
 
-    async void Start()
+    [Tooltip("Voice preset name (e.g., alloy, verse, aria)")]
+    public string voice = "alloy";
+
+    [Tooltip("Basic Instructions")]
+    public string basicInstructions = "You are a helpful, concise voice assistant.";
+
+    [Header("Behavior")]
+    [Tooltip("If true, automatically commit after append and request a response when VAD completes.")]
+    public bool autoCreateResponse = false;
+
+    // ===============================
+    // Internals - WS
+    // ===============================
+    private ClientWebSocket _ws;
+    private CancellationTokenSource _cts;
+    private Uri _uri;
+    private volatile bool _connected;
+
+    // text/ASR
+    private readonly StringBuilder _userTranscript = new StringBuilder();
+
+    // buffers
+    private readonly byte[] _recvBuffer = new byte[1 << 16]; // 64KB
+
+    // events
+    public event Action<string> OnUserTranscriptDone;
+    public event Action<string> OnAssistantTextDelta;
+    public event Action<string> OnAssistantTextDone;
+    public event Action<float> OnAssistantAudioDelta;
+    public event Action<byte[]> OnAssistantAudioDone;
+
+    // response lifecycle (simple)
+    private volatile bool _responseInFlight;
+
+    // ===============================
+    // Unity lifecycle
+    // ===============================
+    private async void Start()
     {
-        ring            = new FloatRingBuffer(sampleRate * channels * 10); // 10秒緩衝
-        source          = gameObject.AddComponent<AudioSource>();
-        clip            = AudioClip.Create("RealtimeClip", sampleRate * channels * 60, channels, sampleRate, true, OnPCMRead);
-        source.clip     = clip;
-        deltaMessage    = new Queue<string>();
-
-        await Connect();
-        await SendSessionUpdate();
-        //await SendSpeak("請自我介紹");
-
-        source.Play();
-    }
-
-    private void Update()
-    {
-        while(deltaMessage != null || deltaMessage.Count > 0)
+        await ConnectAndConfigure();
+        if (_connected)
         {
-            string msg = deltaMessage.Dequeue();
-
-            finishAction?.Invoke(msg);
+            _ = ReceiveLoop();
         }
     }
 
-    async Task Connect()
-    {
-        cts = new CancellationTokenSource();
-        ws  = new ClientWebSocket();
-        ws.Options.SetRequestHeader("Authorization", "Bearer " + apiKey);
-        ws.Options.SetRequestHeader("OpenAI-Beta", "realtime=v1");
-
-        var uri = new Uri($"wss://api.openai.com/v1/realtime?model={model}");
-        await ws.ConnectAsync(uri, cts.Token);
-
-        _ = Task.Run(ReceiveLoop);
-    }
-
-    async Task SendSessionUpdate()
-    {
-        var json = new JObject
+    private async void OnDestroy()
+    {        
+        try
         {
-            ["type"]    = "session.update",
-            ["session"] = new JObject
+            if (_ws != null && _ws.State == WebSocketState.Open)
             {
-                ["modalities"]          = new JArray("audio", "text"),
-                ["voice"]               = voice,
-                ["output_audio_format"] = "pcm16"            // 要用字串，不是物件
+                await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None);
             }
-        };
-        await SendJson(json.ToString());
+        }
+        catch { }
+
+        _cts?.Cancel();
     }
 
-    public void StartToSpeak(string toSpeak = "這是按鈕觸發的 Realtime TTS 測試")
+    // ===============================
+    // Connect & session
+    // ===============================
+    private async Task ConnectAndConfigure()
     {
-        // 你可以用 Inspector 填字，或在這裡固定一段
-        //string toSpeak = "這是按鈕觸發的 Realtime TTS 測試";
+        _uri    = new Uri($"wss://api.openai.com/v1/realtime?model={model}");
+        _ws     = new ClientWebSocket();
+        _ws.Options.SetRequestHeader("Authorization", $"Bearer {openAIApiKey}");
+        _ws.Options.SetRequestHeader("OpenAI-Beta", "realtime=v1");
 
-        // 因為 SendSpeak 是 async，所以用 Task.Run 或直接丟給 Unity 的 async context
-        _ = SendSpeak(toSpeak);
-    }
-
-    public void ReplyAction(Action<string> finishAction)
-    {
-        this.finishAction = finishAction;
-    }
-
-    async Task SendSpeak(string text)
-    {
-        var json = new JObject
+        _cts = new CancellationTokenSource();
+        try
         {
-            ["type"]        = "response.create",
-            ["response"]    = new JObject
+            await _ws.ConnectAsync(_uri, _cts.Token);
+            _connected = _ws.State == WebSocketState.Open;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Realtime connect failed: {ex.Message}");
+            _connected = false; return;
+        }
+
+        if (_connected)
+        {
+            // Minimal and valid session params
+            await SendAsync(new
             {
-                ["instructions"]    = text,
-                ["modalities"]      = new JArray("audio", "text"),
-                //["conversation"] = "none",         // 不延續上下文，單次播放
-                //["temperature"] = 0.6         // 不要有隨機性
-            }
-        };
-        await SendJson(json.ToString());
+                type    = "session.update",
+                session = new
+                {
+                    input_audio_format  = "pcm16",
+                    output_audio_format = "pcm16",
+                    turn_detection = new
+                    {
+                        type                = "server_vad",
+                        threshold           = 0.5,
+                        prefix_padding_ms   = 300,
+                        silence_duration_ms = 500
+                    },
+                    input_audio_transcription   = new { model = "gpt-4o-mini-transcribe" },
+                    instructions                = basicInstructions,
+                    voice                       = voice
+                }
+            });
+        }
     }
 
-    async Task SendJson(string json)
+    public Task SendAsync(object payload)
     {
-        var buf = Encoding.UTF8.GetBytes(json);
-        await ws.SendAsync(new ArraySegment<byte>(buf), WebSocketMessageType.Text, true, cts.Token);
-    }
-
-    async Task ReceiveLoop()
-    {
-        var buf = new byte[8192];
-        var sb  = new StringBuilder();
-
-        while (ws.State == WebSocketState.Open)
+        if (_ws == null || _ws.State != WebSocketState.Open)
         {
-            var result = await ws.ReceiveAsync(new ArraySegment<byte>(buf), cts.Token);
-            
-            if (result.MessageType == WebSocketMessageType.Close)
+            return Task.CompletedTask;
+        }
+
+        string json = JsonConvert.SerializeObject(payload);
+        var bytes   = Encoding.UTF8.GetBytes(json);
+        return _ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, _cts.Token);
+    }
+
+    // ===============================
+    // Receive & events
+    // ===============================
+    private async Task ReceiveLoop()
+    {
+        var textBuilder = new StringBuilder();
+
+        while (_connected && _ws.State == WebSocketState.Open)
+        {
+            WebSocketReceiveResult res;
+            var sb = new StringBuilder();
+            try
+            {
+                do
+                {
+                    res = await _ws.ReceiveAsync(new ArraySegment<byte>(_recvBuffer), _cts.Token);
+                    if (res.MessageType == WebSocketMessageType.Close)
+                    {
+                        Debug.LogWarning($"Realtime closed: {res.CloseStatus} {res.CloseStatusDescription}");
+                        _connected = false; 
+                        break;
+                    }
+                    sb.Append(Encoding.UTF8.GetString(_recvBuffer, 0, res.Count));
+                }
+                while (!res.EndOfMessage);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"Receive error: {ex.Message}");
+                break;
+            }
+
+            if (!_connected)
             {
                 break;
             }
 
-            sb.Append(Encoding.UTF8.GetString(buf, 0, result.Count));
-
-            if (result.EndOfMessage)
+            var payload = sb.ToString();
+            var lines   = payload.Split('\n');
+            foreach (var line in lines)
             {
-                string msg  = sb.ToString();
-                sb.Length   = 0;
-                HandleMessage(msg);
+                if (string.IsNullOrWhiteSpace(line) || !line.Contains("\"type\""))
+                {
+                    continue;
+                }
+
+                HandleServerEvent(line, textBuilder);
             }
         }
     }
 
-    void HandleMessage(string msg)
+    private void HandleServerEvent(string jsonLine, StringBuilder textBuilder)
     {
-        try
+        JObject jo;
+        try { jo = JObject.Parse(jsonLine); }
+        catch
         {
-            var obj     = JObject.Parse(msg);
-            string type = (string)obj["type"];
+            if (jsonLine.Contains("\"error\"")) Debug.LogError($"SERVER ERROR (raw): {jsonLine}");
+            return;
+        }
 
-            Debug.Log(msg);
+        string type = (string)jo["type"] ?? string.Empty;
+        if (string.IsNullOrEmpty(type))
+        {
+            return;
+        }
 
-            switch (type)
-            {
-                case "response.audio.delta":
-                    string b64 = (string)obj["delta"];
-                    if (!string.IsNullOrEmpty(b64))
+        switch (type)
+        {
+            // --- Response lifecycle ---
+            case "response.created":
+                _responseInFlight = true;
+                return;
+            case "response.completed":
+            case "response.done":
+                _responseInFlight = false;
+                return;
+
+            // --- Text stream ---
+            case "response.audio_transcript.delta":
+            case "response.output_text.delta":
+            case "response.text.delta":
+                {
+                    string d = (string)jo["delta"];
+                    if (!string.IsNullOrEmpty(d))
                     {
-                        byte[] pcm      = Convert.FromBase64String(b64);
-                        int sampleCount = pcm.Length / 2;
-                        float[] samples = new float[sampleCount];
-                        for (int i = 0; i < sampleCount; i++)
+                        textBuilder.Append(d);
+                    }
+                    
+                    string txt = textBuilder.ToString();
+                    if (!string.IsNullOrEmpty(txt))
+                    {
+                        OnAssistantTextDelta?.Invoke(txt);
+                    }
+                    Debug.Log($"ASSISTANT TEXT DELTA: {txt}");
+
+                    return;
+                }
+            case "response.audio_transcript.done":
+            case "response.output_text.done":
+            case "response.text.done":
+                {
+                    string txt = textBuilder.ToString();
+                    if (!string.IsNullOrEmpty(txt))
+                    {
+                        OnAssistantTextDone?.Invoke(txt);
+                    }
+                    Debug.Log($"ASSISTANT TEXT: {txt}");
+                    textBuilder.Clear();
+                    return;
+                }
+
+            // --- Audio stream ---
+            case "response.output_audio.delta":
+            case "response.audio.delta":
+                {
+                    string b64 = (string)jo["delta"];
+                    if (string.IsNullOrEmpty(b64))
+                    {
+                        return;
+                    }
+
+                    try
+                    {
+                        var bytes = Convert.FromBase64String(b64);
+                        for (int i = 0; i < bytes.Length; i += 2)
                         {
-                            short s     = BitConverter.ToInt16(pcm, i * 2);
-                            samples[i]  = s / 32768f;
+                            short s = (short)(bytes[i] | (bytes[i + 1] << 8));
+                            float f = s / 32768f; // mono 24k
+                            OnAssistantAudioDelta?.Invoke(f);
                         }
-                        ring.Write(samples, 0, sampleCount);
                     }
-                    break;
-                case "response.audio_transcript.delta":
-                    string deltaText = (string)obj["delta"];
-                    if (!string.IsNullOrEmpty(deltaText))
+                    catch (Exception e) { Debug.LogWarning($"Audio delta decode error: {e.Message}"); }
+                    return;
+                }
+            case "response.output_audio.done":
+                {
+                    OnAssistantAudioDone?.Invoke(Array.Empty<byte>()); // signal done; raw bytes not stored here
+                    return;
+                }
+
+            // --- Assistant ASR of user audio (optional hooks) ---
+            case "conversation.item.input_audio_transcription.delta":
+                {
+                    string d = (string)jo["delta"]; if (!string.IsNullOrEmpty(d)) _userTranscript.Append(d);
+                    return;
+                }
+            case "conversation.item.input_audio_transcription.completed":
+                {
+                    string text = (string)jo["text"];
+                    if (!string.IsNullOrEmpty(text))
                     {
-                        // 累加到暫存變數（方便最後合併成完整文字）
-                        //currentText += deltaText;
-                        deltaMessage.Enqueue(deltaText);
-
-                        Debug.Log("[文字片段] " + deltaText);
+                        OnUserTranscriptDone?.Invoke(text);
+                        Debug.Log($"USER TRANSCRIPT: {text}");
                     }
-                    break;
-                case "error":
-                    Debug.LogError(msg);
-                    break;
+                    _userTranscript.Clear();
+                    if (autoCreateResponse && !_responseInFlight)
+                    {
+                        _ = SendAsync(new { type = "input_audio_buffer.commit" });
+                        // 建立回應 + 指令
+                        _ = SendAsync(new
+                        {
+                            type        = "response.create",
+                            response    = new
+                            {
+                                instructions = basicInstructions
+                            }
+                        });
+                    }
+                    return;
+                }
+
+            // --- Errors ---
+            case "error":
+                {
+                    string code = (string)jo["error"]?["code"];
+                    string msg  = (string)jo["error"]?["message"];
+                    Debug.LogError($"SERVER ERROR: code={code}, message={msg}\n{jsonLine}");
+                    return;
+                }
+
+            default:
+                // Unhandled events are fine for now
+                return;
+        }
+    }
+
+    public async Task SendTextAsync(string inst)
+    {
+        if (!_connected)
+        {
+            return;
+        }
+
+        var create = new
+        {
+            type        = "response.create",
+            response    = new
+            {
+                modalities      = new[] { "text", "audio" },
+                instructions    = inst
             }
-        }
-        catch (Exception e)
-        {
-            Debug.LogWarning("Parse fail: " + e);
-        }
+        };
+
+        await SendAsync(create);
     }
 
-    void OnPCMRead(float[] data)
+    public bool IsConnect()
     {
-        int got = ring.Read(data, 0, data.Length);
-        if (got < data.Length)
-        {
-            for (int i = got; i < data.Length; i++) data[i] = 0;
-        }
-    }
-
-    // 簡單 ring buffer
-    public class FloatRingBuffer
-    {
-        private float[] buf;
-        private int w, r, count;
-        public FloatRingBuffer(int cap) { buf = new float[cap]; }
-        public int Write(float[] src, int off, int len)
-        {
-            int n = Mathf.Min(len, buf.Length - count);
-            for (int i = 0; i < n; i++) { buf[w] = src[off + i]; w = (w + 1) % buf.Length; }
-            count += n; return n;
-        }
-        public int Read(float[] dst, int off, int len)
-        {
-            int n = Mathf.Min(len, count);
-            for (int i = 0; i < n; i++) { dst[off + i] = buf[r]; r = (r + 1) % buf.Length; }
-            count -= n; return n;
-        }
+        return _ws != null && _ws.State == WebSocketState.Open && _connected;
     }
 }

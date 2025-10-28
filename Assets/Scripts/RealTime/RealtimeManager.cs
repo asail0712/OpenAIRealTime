@@ -3,7 +3,7 @@ using UnityEngine.UI;
 
 public class RealtimeManager : MonoBehaviour
 {
-    [SerializeField] private OpenAIRealtime aiRealtime;
+    [SerializeField] private OpenAIRealtimeUnity aiRealtime;
     [SerializeField] private InputField inputText;
     [SerializeField] private Button inputBtn;
     [SerializeField] private Text replyText;
