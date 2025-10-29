@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Threading;
 using System.Threading.Tasks;
+using Unity.Burst.Intrinsics;
 using UnityEngine;
 using UnityEngine.Audio;
 using UnityEngine.UI;
@@ -250,11 +251,20 @@ public class RealTimeChatManager : MonoBehaviour
         aiText.text =  text + "▌"; // 小光標感
     }
 
-    private void HandleAIAudio(float[] f)
+    private void HandleAIAudio(byte[] bytes)
     {
-        for (int i = 0; i < f.Length; i++)
+        int sampleCount = bytes.Length / 2;
+        var block       = new float[sampleCount];
+
+        for (int i = 0, si = 0; i < bytes.Length; i += 2, si++)
         {
-            _rxQueue.Enqueue(f[i]);
+            short s     = (short)(bytes[i] | (bytes[i + 1] << 8));
+            block[si]   = s / 32768f; // mono 24k
+        }
+
+        for (int i = 0; i < block.Length; i++)
+        {
+            _rxQueue.Enqueue(block[i]);
         }
     }
 
@@ -360,7 +370,7 @@ public class RealTimeChatManager : MonoBehaviour
             return;
         }
 
-        if (!aiRealtime.IsConnect())
+        if (!aiRealtime.IsConnected())
         {
             Debug.LogError("WebSocket not connected.");
             return;
@@ -386,7 +396,7 @@ public class RealTimeChatManager : MonoBehaviour
             await Task.Delay(10);
         }
 
-        while (_streamingMic && aiRealtime.IsConnect())
+        while (_streamingMic && aiRealtime.IsConnected())
         {
             int micPos      = Microphone.GetPosition(microphoneDevice);
             if (micPos < 0)
@@ -526,7 +536,7 @@ public class RealTimeChatManager : MonoBehaviour
     [ContextMenu("Send Text Prompt")]
     public async void SendTextPrompt_Context()
     {
-        if (!aiRealtime.IsConnect())
+        if (!aiRealtime.IsConnected())
         {
             Debug.LogError("WebSocket not connected.");
             return;

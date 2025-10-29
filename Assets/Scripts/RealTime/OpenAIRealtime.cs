@@ -41,6 +41,7 @@ public class OpenAIRealtime : IDisposable
 
     // life cycle
     private bool bDisposed = false;
+    private Task recvTask;
 
     // 當前response類別欄位
     private string _activeAssistantItemId;
@@ -53,24 +54,26 @@ public class OpenAIRealtime : IDisposable
     public event Action<string> OnUserTranscriptDone;
     public event Action<string> OnAssistantTextDelta;
     public event Action<string> OnAssistantTextDone;
-    public event Action<float[]> OnAssistantAudioDelta;
+    public event Action<byte[]> OnAssistantAudioDelta;
     public event Action<byte[]> OnAssistantAudioDone;
+    private bool bEventAsync = false;
 
     // ===============================
     // lifecycle
     // ===============================    
-    public OpenAIRealtime(string openAIApiKey, string model, string voice, string basicInstructions, bool bAutoCreateResponse)
+    public OpenAIRealtime(string openAIApiKey, string model, string voice, string basicInstructions, bool bAutoCreateResponse, bool bEventAsync = true)
     {
         this.openAIApiKey           = openAIApiKey;
         this.model                  = model;
         this.voice                  = voice;
         this.basicInstructions      = basicInstructions;
         this.bAutoCreateResponse    = bAutoCreateResponse;
+        this.bEventAsync            = bEventAsync;
     }
 
     public void Update()
     {
-        while (_mainThreadActions.TryDequeue(out var action))
+        while (bEventAsync && _mainThreadActions.TryDequeue(out var action))
         {
             action?.Invoke();
         }
@@ -96,6 +99,19 @@ public class OpenAIRealtime : IDisposable
         // 停新活
         bConnected = false;
 
+        // 1) 先發取消，讓所有 await 能中斷
+        try { _cts?.Cancel(); } catch { }
+
+        // 2) 等 ReceiveLoop 結束（避免 race）
+        try
+        {
+            if (recvTask != null)
+                await recvTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { /* 正常 */ }
+        catch (Exception ex) { Console.WriteLine($"[Warning] recv loop ended with: {ex.Message}"); }
+
+        // 3) 禮貌關閉（帶 timeout 避免無限卡住）
         try
         {
             if (_ws != null && _ws.State == WebSocketState.Open)
@@ -111,7 +127,7 @@ public class OpenAIRealtime : IDisposable
             _ws.Dispose();
             _ws = null;
 
-            _cts?.Cancel();
+            _cts?.Dispose();
             _cts = null;
         }        
     }
@@ -119,14 +135,16 @@ public class OpenAIRealtime : IDisposable
     // ===============================
     // Connect & session
     // ===============================
-    public async Task<bool> ConnectAndConfigure()
+    // 如果你這是在 ASP.NET Core WebSocket gateway 裡面調用，可以直接用：
+    // await client.ConnectAndConfigure(ctx.RequestAborted);
+    public async Task<bool> ConnectAndConfigure(CancellationToken ct = default)
     {
         _uri    = new Uri($"wss://api.openai.com/v1/realtime?model={model}");
         _ws     = new ClientWebSocket();
         _ws.Options.SetRequestHeader("Authorization", $"Bearer {openAIApiKey}");
         _ws.Options.SetRequestHeader("OpenAI-Beta", "realtime=v1");
 
-        _cts    = new CancellationTokenSource();
+        _cts    = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
         try
         {
@@ -162,7 +180,7 @@ public class OpenAIRealtime : IDisposable
                 }
             });
 
-            _ = ReceiveLoop();
+            recvTask = ReceiveLoop();
         }
 
         return bConnected;
@@ -214,7 +232,7 @@ public class OpenAIRealtime : IDisposable
         _squelchItemId = _activeAssistantItemId;                              
 
         // 4) 清空本地播放緩衝，避免播放殘留
-        EmitOnMain(() => OnAssistantAudioDelta?.Invoke(Array.Empty<float>()));
+        //EmitOnMain(() => OnAssistantAudioDelta?.Invoke(Array.Empty<byte>()));
 
         Console.WriteLine($"[Log] Barge-in triggered at {playedMsSoFar} ms");
     }
@@ -249,7 +267,7 @@ public class OpenAIRealtime : IDisposable
         string json = JsonConvert.SerializeObject(payload);
         var bytes   = Encoding.UTF8.GetBytes(json);
 
-        await _sendLock.WaitAsync().ConfigureAwait(false);
+        await _sendLock.WaitAsync(_cts.Token).ConfigureAwait(false);
 
         try
         {
@@ -273,7 +291,7 @@ public class OpenAIRealtime : IDisposable
     {
         var textBuilder = new StringBuilder();
 
-        while (bConnected && _ws.State == WebSocketState.Open)
+        while (bConnected && _ws.State == WebSocketState.Open && !_cts.Token.IsCancellationRequested)
         {
             WebSocketReceiveResult res;
             var sb = new StringBuilder();
@@ -305,6 +323,7 @@ public class OpenAIRealtime : IDisposable
 
             var payload = sb.ToString();
             var lines   = payload.Split('\n');
+
             foreach (var line in lines)
             {
                 if (string.IsNullOrWhiteSpace(line) || !line.Contains("\"type\""))
@@ -412,23 +431,15 @@ public class OpenAIRealtime : IDisposable
                     try
                     {
                         var bytes       = Convert.FromBase64String(b64);
-                        int sampleCount = bytes.Length / 2;
-                        var block       = new float[sampleCount];
-
-                        for (int i = 0, si = 0; i < bytes.Length; i += 2, si++)
-                        {
-                            short s = (short)(bytes[i] | (bytes[i + 1] << 8));
-                            block[si] = s / 32768f; // mono 24k
-                        }
-
-                        EmitOnMain(() => OnAssistantAudioDelta?.Invoke(block));
+                        
+                        EmitOnMain(() => OnAssistantAudioDelta?.Invoke(bytes));
                     }
                     catch (Exception e) { Console.WriteLine($"[Warning] Audio delta decode error: {e.Message}"); }
                     return;
                 }
             case "response.output_audio.done":
                 {
-                    EmitOnMain(() => OnAssistantAudioDone?.Invoke(System.Array.Empty<byte>()));
+                    EmitOnMain(() => OnAssistantAudioDone?.Invoke(Array.Empty<byte>()));
                     return;
                 }
 
@@ -482,10 +493,17 @@ public class OpenAIRealtime : IDisposable
     {
         if (action == null) return;
 
-        _mainThreadActions.Enqueue(action);
+        if(bEventAsync)
+        {
+            _mainThreadActions.Enqueue(action);
+        }
+        else
+        {
+            action.Invoke();
+        }
     }
 
-    public bool IsConnect()
+    public bool IsConnected()
     {
         return _ws != null && _ws.State == WebSocketState.Open && bConnected;
     }
