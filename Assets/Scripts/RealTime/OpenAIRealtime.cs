@@ -1,6 +1,7 @@
 ﻿using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
+using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
@@ -39,23 +40,23 @@ public class OpenAIRealtime : MonoBehaviour
     private ClientWebSocket _ws;
     private CancellationTokenSource _cts;
     private Uri _uri;
-    private volatile bool _connected;
+    private volatile bool _connected;    
+    private readonly StringBuilder _userTranscript = new();     // text/ASR    
+    private readonly byte[] _recvBuffer = new byte[1 << 16];    // buffers 64KB    
+    private volatile bool _responseInFlight;                    // response lifecycle (simple)
 
-    // text/ASR
-    private readonly StringBuilder _userTranscript = new StringBuilder();
+    // 保證 SendAsync 串行化
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
 
-    // buffers
-    private readonly byte[] _recvBuffer = new byte[1 << 16]; // 64KB
-
+    // 把背景執行緒事件丟回主執行緒
+    private readonly ConcurrentQueue<Action> _mainThreadActions = new();
+    
     // events
     public event Action<string> OnUserTranscriptDone;
     public event Action<string> OnAssistantTextDelta;
     public event Action<string> OnAssistantTextDone;
     public event Action<float> OnAssistantAudioDelta;
     public event Action<byte[]> OnAssistantAudioDone;
-
-    // response lifecycle (simple)
-    private volatile bool _responseInFlight;
 
     // ===============================
     // Unity lifecycle
@@ -66,6 +67,14 @@ public class OpenAIRealtime : MonoBehaviour
         if (_connected)
         {
             _ = ReceiveLoop();
+        }
+    }
+
+    private void Update()
+    {
+        while (_mainThreadActions.TryDequeue(out var action))
+        {
+            action?.Invoke();
         }
     }
 
@@ -93,7 +102,8 @@ public class OpenAIRealtime : MonoBehaviour
         _ws.Options.SetRequestHeader("Authorization", $"Bearer {openAIApiKey}");
         _ws.Options.SetRequestHeader("OpenAI-Beta", "realtime=v1");
 
-        _cts = new CancellationTokenSource();
+        _cts    = new CancellationTokenSource();
+
         try
         {
             await _ws.ConnectAsync(_uri, _cts.Token);
@@ -130,16 +140,37 @@ public class OpenAIRealtime : MonoBehaviour
         }
     }
 
-    public Task SendAsync(object payload)
+    public Task SendAudioBase64Async(string audioBase64)
+    {
+        if (string.IsNullOrEmpty(audioBase64)) return Task.CompletedTask;
+        return SendAsync(new { type = "input_audio_buffer.append", audio = audioBase64 });
+    }
+
+    public async Task SendAsync(object payload)
     {
         if (_ws == null || _ws.State != WebSocketState.Open)
         {
-            return Task.CompletedTask;
+            return;
         }
 
         string json = JsonConvert.SerializeObject(payload);
         var bytes   = Encoding.UTF8.GetBytes(json);
-        return _ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, _cts.Token);
+
+        await _sendLock.WaitAsync().ConfigureAwait(false);
+
+        try
+        {
+            if (_ws.State == WebSocketState.Open && !_cts.IsCancellationRequested)
+            {
+                await _ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, _cts.Token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) { /* ignore on shutdown */ }
+        catch (WebSocketException wse) { Debug.LogWarning($"Send error: {wse.Message}"); }
+        finally
+        {
+            _sendLock.Release();
+        }
     }
 
     // ===============================
@@ -234,7 +265,7 @@ public class OpenAIRealtime : MonoBehaviour
                     string txt = textBuilder.ToString();
                     if (!string.IsNullOrEmpty(txt))
                     {
-                        OnAssistantTextDelta?.Invoke(txt);
+                        EmitOnMain(() => OnAssistantTextDelta?.Invoke(txt));
                     }
                     Debug.Log($"ASSISTANT TEXT DELTA: {txt}");
 
@@ -247,7 +278,7 @@ public class OpenAIRealtime : MonoBehaviour
                     string txt = textBuilder.ToString();
                     if (!string.IsNullOrEmpty(txt))
                     {
-                        OnAssistantTextDone?.Invoke(txt);
+                        EmitOnMain(() => OnAssistantTextDone?.Invoke(txt));
                     }
                     Debug.Log($"ASSISTANT TEXT: {txt}");
                     textBuilder.Clear();
@@ -271,7 +302,7 @@ public class OpenAIRealtime : MonoBehaviour
                         {
                             short s = (short)(bytes[i] | (bytes[i + 1] << 8));
                             float f = s / 32768f; // mono 24k
-                            OnAssistantAudioDelta?.Invoke(f);
+                            EmitOnMain(() => OnAssistantAudioDelta?.Invoke(f));
                         }
                     }
                     catch (Exception e) { Debug.LogWarning($"Audio delta decode error: {e.Message}"); }
@@ -279,7 +310,7 @@ public class OpenAIRealtime : MonoBehaviour
                 }
             case "response.output_audio.done":
                 {
-                    OnAssistantAudioDone?.Invoke(Array.Empty<byte>()); // signal done; raw bytes not stored here
+                    EmitOnMain(() => OnAssistantAudioDone?.Invoke(System.Array.Empty<byte>()));
                     return;
                 }
 
@@ -294,7 +325,7 @@ public class OpenAIRealtime : MonoBehaviour
                     string text = (string)jo["text"];
                     if (!string.IsNullOrEmpty(text))
                     {
-                        OnUserTranscriptDone?.Invoke(text);
+                        EmitOnMain(() => OnUserTranscriptDone?.Invoke(text));
                         Debug.Log($"USER TRANSCRIPT: {text}");
                     }
                     _userTranscript.Clear();
@@ -327,6 +358,13 @@ public class OpenAIRealtime : MonoBehaviour
                 // Unhandled events are fine for now
                 return;
         }
+    }
+
+    private void EmitOnMain(Action action)
+    {
+        if (action == null) return;
+
+        _mainThreadActions.Enqueue(action);
     }
 
     public async Task SendTextAsync(string inst)

@@ -400,10 +400,7 @@ public class RealTimeChatManager : MonoBehaviour
             string b64 = Convert.ToBase64String(_pcmBuf, 0, byteCount);
             _micReadPos = (_micReadPos + toSend) % _clipSamples;
 
-            await aiRealtime.SendAsync(new { type = "input_audio_buffer.append", audio = b64 });
-            // If you want auto-commit+respond each chunk, uncomment below lines
-            // await SendAsync(new { type = "input_audio_buffer.commit" });
-            // if (!_responseInFlight && autoCreateResponse) await SendAsync(new { type = "response.create" });
+            await aiRealtime.SendAudioBase64Async(b64);
         }
     }
 
