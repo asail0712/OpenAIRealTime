@@ -6,7 +6,6 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using UnityEngine;
 
 /// <summary>
 /// Refactored & trimmed version based on user's original file.
@@ -29,22 +28,24 @@ public class OpenAIRealtime : IDisposable
     private ClientWebSocket _ws;
     private CancellationTokenSource _cts;
     private Uri _uri;
-    private volatile bool _connected;    
+    private volatile bool bConnected;    
     private readonly StringBuilder _userTranscript = new();     // text/ASR    
     private readonly byte[] _recvBuffer = new byte[1 << 16];    // buffers 64KB    
-    private volatile bool _responseInFlight;                    // response lifecycle (simple)
+    private volatile bool bResponseInFlight;                    // response lifecycle (simple)
 
     // 保證 SendAsync 串行化
     private readonly SemaphoreSlim _sendLock = new(1, 1);
 
     // 把背景執行緒事件丟回主執行緒
     private readonly ConcurrentQueue<Action> _mainThreadActions = new();
-    
+
+    private bool bDisposed = false;
+
     // events
     public event Action<string> OnUserTranscriptDone;
     public event Action<string> OnAssistantTextDelta;
     public event Action<string> OnAssistantTextDone;
-    public event Action<float> OnAssistantAudioDelta;
+    public event Action<float[]> OnAssistantAudioDelta;
     public event Action<byte[]> OnAssistantAudioDone;
 
     // ===============================
@@ -67,24 +68,50 @@ public class OpenAIRealtime : IDisposable
         }
     }
 
-    public async void Dispose()
-    {        
+    public void Dispose()
+    {
+        if (bDisposed) return;
+        bDisposed = true;
+
+        try
+        {
+            // 最後一道防線：盡量避免在 UI/主緒卡住
+            DisposeAsync().ConfigureAwait(false).GetAwaiter().GetResult();
+        }
+        catch { /* 最終防呆，避免例外往外拋 */ }
+    }
+
+    public async Task DisposeAsync()
+    {
+        if (bDisposed) return;
+
+        // 停新活
+        bConnected = false;
+
         try
         {
             if (_ws != null && _ws.State == WebSocketState.Open)
             {
-                await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None);
+                using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+                await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", closeCts.Token).ConfigureAwait(false);
             }
         }
         catch { }
+        finally
+        {
+            _ws.Dispose();
+            _ws = null;
 
-        _cts?.Cancel();
+            _cts?.Cancel();
+            _cts = null;
+        }        
     }
 
     // ===============================
     // Connect & session
     // ===============================
-    public async Task ConnectAndConfigure()
+    public async Task<bool> ConnectAndConfigure()
     {
         _uri    = new Uri($"wss://api.openai.com/v1/realtime?model={model}");
         _ws     = new ClientWebSocket();
@@ -96,15 +123,15 @@ public class OpenAIRealtime : IDisposable
         try
         {
             await _ws.ConnectAsync(_uri, _cts.Token);
-            _connected = _ws.State == WebSocketState.Open;
+            bConnected = _ws.State == WebSocketState.Open;
         }
         catch (Exception ex)
         {
-            Debug.LogError($"Realtime connect failed: {ex.Message}");
-            _connected = false; return;
+            Console.WriteLine($"[Error] Realtime connect failed: {ex.Message}");
+            bConnected = false; 
         }
 
-        if (_connected)
+        if (bConnected)
         {
             // Minimal and valid session params
             await SendAsync(new
@@ -129,6 +156,8 @@ public class OpenAIRealtime : IDisposable
 
             _ = ReceiveLoop();
         }
+
+        return bConnected;
     }
 
     public Task SendAudioBase64Async(string audioBase64)
@@ -157,7 +186,7 @@ public class OpenAIRealtime : IDisposable
             }
         }
         catch (OperationCanceledException) { /* ignore on shutdown */ }
-        catch (WebSocketException wse) { Debug.LogWarning($"Send error: {wse.Message}"); }
+        catch (WebSocketException wse) { Console.WriteLine($"[Warning] Send error: {wse.Message}"); }
         finally
         {
             _sendLock.Release();
@@ -171,7 +200,7 @@ public class OpenAIRealtime : IDisposable
     {
         var textBuilder = new StringBuilder();
 
-        while (_connected && _ws.State == WebSocketState.Open)
+        while (bConnected && _ws.State == WebSocketState.Open)
         {
             WebSocketReceiveResult res;
             var sb = new StringBuilder();
@@ -182,8 +211,8 @@ public class OpenAIRealtime : IDisposable
                     res = await _ws.ReceiveAsync(new ArraySegment<byte>(_recvBuffer), _cts.Token);
                     if (res.MessageType == WebSocketMessageType.Close)
                     {
-                        Debug.LogWarning($"Realtime closed: {res.CloseStatus} {res.CloseStatusDescription}");
-                        _connected = false; 
+                        Console.WriteLine($"[Warning] Realtime closed: {res.CloseStatus} {res.CloseStatusDescription}");
+                        bConnected = false; 
                         break;
                     }
                     sb.Append(Encoding.UTF8.GetString(_recvBuffer, 0, res.Count));
@@ -192,11 +221,11 @@ public class OpenAIRealtime : IDisposable
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"Receive error: {ex.Message}");
+                Console.WriteLine($"[Warning] Receive error: {ex.Message}");
                 break;
             }
 
-            if (!_connected)
+            if (!bConnected)
             {
                 break;
             }
@@ -221,7 +250,7 @@ public class OpenAIRealtime : IDisposable
         try { jo = JObject.Parse(jsonLine); }
         catch
         {
-            if (jsonLine.Contains("\"error\"")) Debug.LogError($"SERVER ERROR (raw): {jsonLine}");
+            if (jsonLine.Contains("\"error\"")) Console.WriteLine($"[Error] SERVER ERROR (raw): {jsonLine}");
             return;
         }
 
@@ -235,11 +264,11 @@ public class OpenAIRealtime : IDisposable
         {
             // --- Response lifecycle ---
             case "response.created":
-                _responseInFlight = true;
+                bResponseInFlight = true;
                 return;
             case "response.completed":
             case "response.done":
-                _responseInFlight = false;
+                bResponseInFlight = false;
                 return;
 
             // --- Text stream ---
@@ -258,7 +287,7 @@ public class OpenAIRealtime : IDisposable
                     {
                         EmitOnMain(() => OnAssistantTextDelta?.Invoke(txt));
                     }
-                    Debug.Log($"ASSISTANT TEXT DELTA: {txt}");
+                    Console.WriteLine($"[Log] ASSISTANT TEXT DELTA: {txt}");
 
                     return;
                 }
@@ -271,7 +300,7 @@ public class OpenAIRealtime : IDisposable
                     {
                         EmitOnMain(() => OnAssistantTextDone?.Invoke(txt));
                     }
-                    Debug.Log($"ASSISTANT TEXT: {txt}");
+                    Console.WriteLine($"[Log] ASSISTANT TEXT: {txt}");
                     textBuilder.Clear();
                     return;
                 }
@@ -288,15 +317,19 @@ public class OpenAIRealtime : IDisposable
 
                     try
                     {
-                        var bytes = Convert.FromBase64String(b64);
-                        for (int i = 0; i < bytes.Length; i += 2)
+                        var bytes       = Convert.FromBase64String(b64);
+                        int sampleCount = bytes.Length / 2;
+                        var block       = new float[sampleCount];
+
+                        for (int i = 0, si = 0; i < bytes.Length; i += 2, si++)
                         {
                             short s = (short)(bytes[i] | (bytes[i + 1] << 8));
-                            float f = s / 32768f; // mono 24k
-                            EmitOnMain(() => OnAssistantAudioDelta?.Invoke(f));
+                            block[si] = s / 32768f; // mono 24k
                         }
+
+                        EmitOnMain(() => OnAssistantAudioDelta?.Invoke(block));
                     }
-                    catch (Exception e) { Debug.LogWarning($"Audio delta decode error: {e.Message}"); }
+                    catch (Exception e) { Console.WriteLine($"[Warning] Audio delta decode error: {e.Message}"); }
                     return;
                 }
             case "response.output_audio.done":
@@ -317,10 +350,10 @@ public class OpenAIRealtime : IDisposable
                     if (!string.IsNullOrEmpty(text))
                     {
                         EmitOnMain(() => OnUserTranscriptDone?.Invoke(text));
-                        Debug.Log($"USER TRANSCRIPT: {text}");
+                        Console.WriteLine($"[Log] USER TRANSCRIPT: {text}");
                     }
                     _userTranscript.Clear();
-                    if (bAutoCreateResponse && !_responseInFlight)
+                    if (bAutoCreateResponse && !bResponseInFlight)
                     {
                         _ = SendAsync(new { type = "input_audio_buffer.commit" });
                         // 建立回應 + 指令
@@ -341,7 +374,7 @@ public class OpenAIRealtime : IDisposable
                 {
                     string code = (string)jo["error"]?["code"];
                     string msg  = (string)jo["error"]?["message"];
-                    Debug.LogError($"SERVER ERROR: code={code}, message={msg}\n{jsonLine}");
+                    Console.WriteLine($"[Error] SERVER ERROR: code={code}, message={msg}\n{jsonLine}");
                     return;
                 }
 
@@ -360,7 +393,7 @@ public class OpenAIRealtime : IDisposable
 
     public async Task SendTextAsync(string inst)
     {
-        if (!_connected)
+        if (!bConnected)
         {
             return;
         }
@@ -380,6 +413,6 @@ public class OpenAIRealtime : IDisposable
 
     public bool IsConnect()
     {
-        return _ws != null && _ws.State == WebSocketState.Open && _connected;
+        return _ws != null && _ws.State == WebSocketState.Open && bConnected;
     }
 }

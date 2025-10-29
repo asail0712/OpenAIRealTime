@@ -217,9 +217,12 @@ public class RealTimeChatManager : MonoBehaviour
         aiText.text =  text + "▌"; // 小光標感
     }
 
-    private void HandleAIAudio(float f)
+    private void HandleAIAudio(float[] f)
     {
-        _rxQueue.Enqueue(f);
+        for (int i = 0; i < f.Length; i++)
+        {
+            _rxQueue.Enqueue(f[i]);
+        }
     }
 
     // =============== Helpers ===============
