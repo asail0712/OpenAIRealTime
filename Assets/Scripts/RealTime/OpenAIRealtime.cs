@@ -6,7 +6,6 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using UnityEngine;
 
 /// <summary>
 /// Refactored & trimmed version based on user's original file.
@@ -203,7 +202,7 @@ public class OpenAIRealtime : IDisposable
     public async Task BargeInAsync(float playedSeconds)
     {
         // 把秒轉毫秒
-        int playedMsSoFar = Mathf.RoundToInt(playedSeconds * 1000f);
+        int playedMsSoFar = (int)Math.Round(playedSeconds * 1000f);
 
         // 1) 停止助理的語音生成
         await InterruptAsync().ConfigureAwait(false);
