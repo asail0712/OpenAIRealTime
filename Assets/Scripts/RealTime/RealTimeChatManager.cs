@@ -8,8 +8,26 @@ using UnityEngine.UI;
 
 public class RealTimeChatManager : MonoBehaviour
 {
+    // ===============================
+    // Config (Inspector)
+    // ===============================
+    [Header("OpenAI Settings")]
+    [Tooltip("Your OpenAI API key (sk-...) – store securely for production.")]
+    public string openAIApiKey = string.Empty;
+
+    [Tooltip("Realtime model name. e.g. gpt-4o-mini-realtime-preview")]
+    public string model = "gpt-4o-mini-realtime-preview";
+
+    [Tooltip("Voice preset name (e.g., alloy, verse, aria)")]
+    public string voice = "alloy";
+
+    [Tooltip("Basic Instructions")]
+    public string basicInstructions = "You are a helpful, concise voice assistant.";
+
+    [Tooltip("If true, automatically commit after append and request a response when VAD completes.")]
+    public bool bAutoCreateResponse = false;
+
     [Header("Wiring")]
-    [SerializeField] private OpenAIRealtime aiRealtime;
     [SerializeField] private Text userText; // 顯示使用者語音轉文字(含逐字&最終)
     [SerializeField] private Text aiText;   // 顯示 AI 回覆(含逐字&最終)
     [SerializeField] private Button micBtn; // 點擊=切換；長按=Push-To-Talk
@@ -36,13 +54,14 @@ public class RealTimeChatManager : MonoBehaviour
     public bool IsMicOn { get => _streamingMic; }
 
     // ===============================
-    // Internals - Mic capture/send
+    // OpenAI realtime
     // ===============================
-    private AudioClip _micClip;
+    private OpenAIRealtime aiRealtime;
 
     // ===============================
     // Internals - Mic capture/send
     // ===============================
+    private AudioClip _micClip;
     private int _micReadPos;
     private int _clipSamples;
     private int _clipChannels;
@@ -83,8 +102,12 @@ public class RealTimeChatManager : MonoBehaviour
             playbackSource.spatialBlend = 0f;
         }
 
-        _dspSampleRate = AudioSettings.outputSampleRate;
+        // sample rate監控與設定
+        _dspSampleRate  = AudioSettings.outputSampleRate;
         AudioSettings.OnAudioConfigurationChanged += OnAudioConfigChanged;
+
+        // openai 物件
+        aiRealtime      = new OpenAIRealtime(openAIApiKey, model, voice, basicInstructions, bAutoCreateResponse);        
     }
 
     private void OnEnable()
@@ -108,13 +131,20 @@ public class RealTimeChatManager : MonoBehaviour
         //aiRealtimeUnity.OnSessionStateChanged -= HandleSessionStateChanged;
     }
 
-    private void Start()
+    private async void Start()
     {
         // 啟動時保險：把顯示清空
         if (userText) userText.text = "";
         if (aiText) aiText.text = "";
 
         RefreshMicUI();
+
+        await aiRealtime.ConnectAndConfigure();
+    }
+
+    private void Update()
+    {
+        aiRealtime.Update();
     }
 
     private async void OnDestroy()
@@ -131,6 +161,8 @@ public class RealTimeChatManager : MonoBehaviour
         }
 
         AudioSettings.OnAudioConfigurationChanged -= OnAudioConfigChanged;
+
+        aiRealtime.Dispose();
     }
 
     private void OnAudioConfigChanged(bool deviceWasChanged)

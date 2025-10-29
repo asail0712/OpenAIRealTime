@@ -12,27 +12,16 @@ using UnityEngine;
 /// Refactored & trimmed version based on user's original file.
 /// Focus: clear responsibilities, minimal state, safe defaults, and readable flow.
 /// </summary>
-public class OpenAIRealtime : MonoBehaviour
+public class OpenAIRealtime : IDisposable
 {
     // ===============================
     // Config (Inspector)
     // ===============================
-    [Header("OpenAI Settings")]
-    [Tooltip("Your OpenAI API key (sk-...) – store securely for production.")]
-    public string openAIApiKey = string.Empty;
-
-    [Tooltip("Realtime model name. e.g. gpt-4o-mini-realtime-preview")]
-    public string model = "gpt-4o-mini-realtime-preview";
-
-    [Tooltip("Voice preset name (e.g., alloy, verse, aria)")]
-    public string voice = "alloy";
-
-    [Tooltip("Basic Instructions")]
+    public string openAIApiKey      = string.Empty;
+    public string model             = "gpt-4o-mini-realtime-preview";
+    public string voice             = "alloy";
     public string basicInstructions = "You are a helpful, concise voice assistant.";
-
-    [Header("Behavior")]
-    [Tooltip("If true, automatically commit after append and request a response when VAD completes.")]
-    public bool autoCreateResponse = false;
+    public bool bAutoCreateResponse = false;
 
     // ===============================
     // Internals - WS
@@ -59,18 +48,18 @@ public class OpenAIRealtime : MonoBehaviour
     public event Action<byte[]> OnAssistantAudioDone;
 
     // ===============================
-    // Unity lifecycle
-    // ===============================
-    private async void Start()
+    // lifecycle
+    // ===============================    
+    public OpenAIRealtime(string openAIApiKey, string model, string voice, string basicInstructions, bool bAutoCreateResponse)
     {
-        await ConnectAndConfigure();
-        if (_connected)
-        {
-            _ = ReceiveLoop();
-        }
+        this.openAIApiKey           = openAIApiKey;
+        this.model                  = model;
+        this.voice                  = voice;
+        this.basicInstructions      = basicInstructions;
+        this.bAutoCreateResponse    = bAutoCreateResponse;
     }
 
-    private void Update()
+    public void Update()
     {
         while (_mainThreadActions.TryDequeue(out var action))
         {
@@ -78,7 +67,7 @@ public class OpenAIRealtime : MonoBehaviour
         }
     }
 
-    private async void OnDestroy()
+    public async void Dispose()
     {        
         try
         {
@@ -95,7 +84,7 @@ public class OpenAIRealtime : MonoBehaviour
     // ===============================
     // Connect & session
     // ===============================
-    private async Task ConnectAndConfigure()
+    public async Task ConnectAndConfigure()
     {
         _uri    = new Uri($"wss://api.openai.com/v1/realtime?model={model}");
         _ws     = new ClientWebSocket();
@@ -137,6 +126,8 @@ public class OpenAIRealtime : MonoBehaviour
                     voice                       = voice
                 }
             });
+
+            _ = ReceiveLoop();
         }
     }
 
@@ -329,7 +320,7 @@ public class OpenAIRealtime : MonoBehaviour
                         Debug.Log($"USER TRANSCRIPT: {text}");
                     }
                     _userTranscript.Clear();
-                    if (autoCreateResponse && !_responseInFlight)
+                    if (bAutoCreateResponse && !_responseInFlight)
                     {
                         _ = SendAsync(new { type = "input_audio_buffer.commit" });
                         // 建立回應 + 指令

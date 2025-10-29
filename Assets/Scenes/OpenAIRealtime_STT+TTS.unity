@@ -959,7 +959,6 @@ GameObject:
   m_Component:
   - component: {fileID: 1951665199}
   - component: {fileID: 1951665200}
-  - component: {fileID: 1951665201}
   m_Layer: 0
   m_Name: RealTimeChatManager
   m_TagString: Untagged
@@ -994,7 +993,11 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d68bee29c7aa25042abd3537d3352c27, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  aiRealtime: {fileID: 1951665201}
+  openAIApiKey: 
+  model: gpt-4o-mini-realtime-preview
+  voice: alloy
+  basicInstructions: "\u4F60\u662F\u4E00\u500B\u570B\u4E2D\u6578\u5B78\u8001\u5E2B\uFF0C\u53EF\u4EE5\u89E3\u7B54\u6240\u6709\u5B78\u751F\u7684\u6578\u5B78\u554F\u984C"
+  bAutoCreateResponse: 1
   userText: {fileID: 0}
   aiText: {fileID: 748965555}
   micBtn: {fileID: 1118283998}
@@ -1004,23 +1007,6 @@ MonoBehaviour:
   playbackSource: {fileID: 0}
   sampleRate: 24000
   sendChunkSeconds: 0.25
---- !u!114 &1951665201
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1951665197}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: dc122f40ff27fe24e9f5fdb213839480, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  openAIApiKey: 
-  model: gpt-4o-mini-realtime-preview
-  voice: coral
-  basicInstructions: "\u4F60\u662F\u4E00\u500B\u570B\u4E2D\u6578\u5B78\u8001\u5E2B\uFF0C\u53EF\u4EE5\u89E3\u7B54\u6240\u6709\u5B78\u751F\u7684\u6578\u5B78\u554F\u984C"
-  autoCreateResponse: 1
 --- !u!1 &2119571763
 GameObject:
   m_ObjectHideFlags: 0
