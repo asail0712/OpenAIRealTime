@@ -4,6 +4,7 @@ using System.Net.WebSockets;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
+using UnityEngine.Audio;
 using UnityEngine.UI;
 
 public class RealTimeChatManager : MonoBehaviour
@@ -38,6 +39,7 @@ public class RealTimeChatManager : MonoBehaviour
     [Header("Optional: Typed input(非必接)")]
     [SerializeField] private InputField typedInput; // 若你有打字輸入就接上
     [SerializeField] private Button sendBtn;
+    [SerializeField] private Button interruptAIBtn;
 
     [Header("Playback")]
     public AudioSource playbackSource; // attach an AudioSource (optional for TTS playback)
@@ -93,6 +95,10 @@ public class RealTimeChatManager : MonoBehaviour
         {
             sendBtn.onClick.AddListener(OnSendClicked);
         }
+        if (interruptAIBtn != null)
+        {
+            interruptAIBtn.onClick.AddListener(OnInterruptClicked);
+        }
 
         if (!playbackSource)
         {
@@ -113,21 +119,26 @@ public class RealTimeChatManager : MonoBehaviour
     private void OnEnable()
     {
         // ===== 事件訂閱（對應你的 OpenAIRealtimeUnity 事件命名調整一下） =====
+        // 表示收到AI response
+        aiRealtime.OnResposeStart           += HandleAIResposeStart;
+        aiRealtime.OnResposeFinish          += HandleAIResposeFinish;
         // 使用者逐字轉寫
-        //aiRealtimeUnity.OnUserTranscript += HandleUserTranscript;                       // TODO: Action<string> partialOrFinal
+        //aiRealtimeUnity.OnUserTranscript  += HandleUserTranscript;                       // TODO: Action<string> partialOrFinal
         // AI 逐字/最終文字（帶 isFinal 旗標）
-        aiRealtime.OnAssistantTextDelta    += HandleAITranscript;                           // TODO: Action<string,bool>
+        aiRealtime.OnAssistantTextDelta     += HandleAITranscript;                           // TODO: Action<string,bool>
         // AI 語音資訊
-        aiRealtime.OnAssistantAudioDelta   += HandleAIAudio;
+        aiRealtime.OnAssistantAudioDelta    += HandleAIAudio;
         // 連線/工作階段狀態（可選）
         //aiRealtimeUnity.OnSessionStateChanged += HandleSessionStateChanged;             // TODO: Action<string>
     }
 
     private void OnDisable()
     {
-        //aiRealtimeUnity.OnUserTranscript -= HandleUserTranscript;
-        aiRealtime.OnAssistantTextDelta    -= HandleAITranscript;
-        aiRealtime.OnAssistantAudioDelta   -= HandleAIAudio;
+        //aiRealtimeUnity.OnUserTranscript      -= HandleUserTranscript;
+        aiRealtime.OnResposeStart               -= HandleAIResposeStart;
+        aiRealtime.OnResposeFinish              -= HandleAIResposeFinish;
+        aiRealtime.OnAssistantTextDelta         -= HandleAITranscript;
+        aiRealtime.OnAssistantAudioDelta        -= HandleAIAudio;
         //aiRealtimeUnity.OnSessionStateChanged -= HandleSessionStateChanged;
     }
 
@@ -197,7 +208,7 @@ public class RealTimeChatManager : MonoBehaviour
     private async void OnSendClicked()
     {
         if (typedInput == null || string.IsNullOrWhiteSpace(typedInput.text)) return;
-        string msg = typedInput.text.Trim();
+        string msg      = typedInput.text.Trim();
         typedInput.text = "";
 
         // 顯示在使用者視窗
@@ -207,7 +218,29 @@ public class RealTimeChatManager : MonoBehaviour
         await SafeCall(async () => await aiRealtime.SendTextAsync(msg)); // TODO: 若你方法名不同，改成對應
     }
 
+    // =============== interrupt ai talk ================
+    private async void OnInterruptClicked()
+    {
+        if (aiRealtime == null) return;
+
+        // 中斷處理
+        playbackSource.enabled = false;
+        
+        await aiRealtime.BargeInAsync(0f);
+    }
+
     // =============== Realtime Callbacks ===============
+
+    private void HandleAIResposeStart()
+    {
+        playbackSource.enabled = true;
+        _rxQueue.Clear();
+    }
+
+    private void HandleAIResposeFinish()
+    {
+        //playbackSource.enabled = false;
+    }
 
     private void HandleAITranscript(string text)
     {
@@ -426,13 +459,15 @@ public class RealTimeChatManager : MonoBehaviour
 
             for (int i = 0, b = 0; i < toSend; i++, b += 2)
             {
-                float f = Mathf.Clamp(_monoBuf[i], -1f, 1f);
-                short s = (short)Mathf.RoundToInt(f * 32767f);
-                _pcmBuf[b] = (byte)(s & 0xFF);
-                _pcmBuf[b + 1] = (byte)((s >> 8) & 0xFF);
+                float f         = Mathf.Clamp(_monoBuf[i], -1f, 1f);
+                short s         = (short)Mathf.RoundToInt(f * 32767f);
+                _pcmBuf[b]      = (byte)(s & 0xFF);
+                _pcmBuf[b + 1]  = (byte)((s >> 8) & 0xFF);
             }
 
-            string b64 = Convert.ToBase64String(_pcmBuf, 0, byteCount);
+            // 做vad判斷
+
+            string b64  = Convert.ToBase64String(_pcmBuf, 0, byteCount);
             _micReadPos = (_micReadPos + toSend) % _clipSamples;
 
             await aiRealtime.SendAudioBase64Async(b64);

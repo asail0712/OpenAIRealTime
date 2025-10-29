@@ -6,6 +6,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using UnityEngine;
 
 /// <summary>
 /// Refactored & trimmed version based on user's original file.
@@ -29,9 +30,9 @@ public class OpenAIRealtime : IDisposable
     private CancellationTokenSource _cts;
     private Uri _uri;
     private volatile bool bConnected;    
-    private readonly StringBuilder _userTranscript = new();     // text/ASR    
-    private readonly byte[] _recvBuffer = new byte[1 << 16];    // buffers 64KB    
-    private volatile bool bResponseInFlight;                    // response lifecycle (simple)
+    private readonly StringBuilder _userTranscript  = new();                // text/ASR    
+    private readonly byte[] _recvBuffer             = new byte[1 << 16];    // buffers 64KB    
+    private volatile bool bResponseInFlight;                                // response lifecycle (simple)
 
     // 保證 SendAsync 串行化
     private readonly SemaphoreSlim _sendLock = new(1, 1);
@@ -39,9 +40,17 @@ public class OpenAIRealtime : IDisposable
     // 把背景執行緒事件丟回主執行緒
     private readonly ConcurrentQueue<Action> _mainThreadActions = new();
 
+    // life cycle
     private bool bDisposed = false;
 
+    // 當前response類別欄位
+    private string _activeAssistantItemId;
+    private int? _activeAudioContentIndex;
+    private string _squelchItemId; // 要丟棄的舊 item（本地消音用）
+
     // events
+    public event Action OnResposeStart;
+    public event Action OnResposeFinish;
     public event Action<string> OnUserTranscriptDone;
     public event Action<string> OnAssistantTextDelta;
     public event Action<string> OnAssistantTextDone;
@@ -141,7 +150,7 @@ public class OpenAIRealtime : IDisposable
                 {
                     input_audio_format  = "pcm16",
                     output_audio_format = "pcm16",
-                    turn_detection = new
+                    turn_detection      = new
                     {
                         type                = "server_vad",
                         threshold           = 0.5,
@@ -164,6 +173,71 @@ public class OpenAIRealtime : IDisposable
     {
         if (string.IsNullOrEmpty(audioBase64)) return Task.CompletedTask;
         return SendAsync(new { type = "input_audio_buffer.append", audio = audioBase64 });
+    }
+
+    public Task InterruptAsync()
+    {
+        // 取消正在產生中（語音/文字）的回覆
+        return SendAsync(new { type = "response.cancel" }); // 無參數即可
+    }
+
+    // audioEndMs：你本地端實際「已播放」到的毫秒數（用播放過的 sample 數換算）
+    public Task TruncateAsync(int audioEndMs, int? contentIndex = null)
+    {
+        if (string.IsNullOrEmpty(_activeAssistantItemId)) return Task.CompletedTask;
+
+        int idx = contentIndex ?? _activeAudioContentIndex ?? 0; // 最後才退回 0
+
+        return SendAsync(new
+        {
+            type            = "conversation.item.truncate",
+            item_id         = _activeAssistantItemId,
+            content_index   = idx,
+            audio_end_ms    = Math.Max(0, audioEndMs)
+        });
+    }
+
+    /************************************
+     * 中斷當前response
+     * *********************************/
+    public async Task BargeInAsync(float playedSeconds)
+    {
+        // 把秒轉毫秒
+        int playedMsSoFar = Mathf.RoundToInt(playedSeconds * 1000f);
+
+        // 1) 停止助理的語音生成
+        await InterruptAsync().ConfigureAwait(false);
+
+        // 2) 告訴伺服器「我只聽到這裡」
+        await TruncateAsync(playedMsSoFar).ConfigureAwait(false);
+
+        // 3) 本地丟棄舊 item 的後續 delta
+        _squelchItemId = _activeAssistantItemId;                              
+
+        // 4) 清空本地播放緩衝，避免播放殘留
+        EmitOnMain(() => OnAssistantAudioDelta?.Invoke(Array.Empty<float>()));
+
+        Console.WriteLine($"[Log] Barge-in triggered at {playedMsSoFar} ms");
+    }
+
+    public async Task SendTextAsync(string inst)
+    {
+        if (!bConnected)
+        {
+            return;
+        }
+
+        var create              = new
+        {
+            type                = "response.create",
+            response            = new
+            {
+                modalities      = new[] { "text", "audio" },
+                instructions    = inst
+            }
+        };
+
+        await SendAsync(create);
     }
 
     public async Task SendAsync(object payload)
@@ -265,12 +339,22 @@ public class OpenAIRealtime : IDisposable
             // --- Response lifecycle ---
             case "response.created":
                 bResponseInFlight = true;
+
+                EmitOnMain(() => OnResposeStart?.Invoke());
                 return;
             case "response.completed":
             case "response.done":
                 bResponseInFlight = false;
-                return;
 
+                EmitOnMain(() => OnResposeFinish?.Invoke());
+                return;
+            case "response.output_item.added":
+                {
+                    _activeAssistantItemId      = (string)jo["item"]?["id"];
+                    _activeAudioContentIndex    = null;                     // 直到看到音訊 delta 才知道 index
+                    _squelchItemId              = null;                     // 新 item 開始，取消消音
+                    return;
+                }
             // --- Text stream ---
             case "response.audio_transcript.delta":
             case "response.output_text.delta":
@@ -309,6 +393,17 @@ public class OpenAIRealtime : IDisposable
             case "response.output_audio.delta":
             case "response.audio.delta":
                 {
+                    // 先丟棄被消音的舊 item
+                    var itemId = (string)jo["item_id"];
+                    if (!string.IsNullOrEmpty(_squelchItemId) && _squelchItemId == itemId) return;
+
+                    // 紀錄 audio 的 content_index
+                    if (jo["content_index"] != null)
+                    {
+                        _activeAudioContentIndex = (int?)jo["content_index"];
+                    }
+
+                    // 讀取音頻內容
                     string b64 = (string)jo["delta"];
                     if (string.IsNullOrEmpty(b64))
                     {
@@ -389,26 +484,6 @@ public class OpenAIRealtime : IDisposable
         if (action == null) return;
 
         _mainThreadActions.Enqueue(action);
-    }
-
-    public async Task SendTextAsync(string inst)
-    {
-        if (!bConnected)
-        {
-            return;
-        }
-
-        var create = new
-        {
-            type        = "response.create",
-            response    = new
-            {
-                modalities      = new[] { "text", "audio" },
-                instructions    = inst
-            }
-        };
-
-        await SendAsync(create);
     }
 
     public bool IsConnect()
