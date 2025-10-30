@@ -7,6 +7,13 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
+public enum DebugLevel
+{
+    Log,
+    Warning,
+    Error,
+}
+
 /// <summary>
 /// Refactored & trimmed version based on user's original file.
 /// Focus: clear responsibilities, minimal state, safe defaults, and readable flow.
@@ -28,13 +35,14 @@ public class OpenAIRealtime : IDisposable
     private ClientWebSocket _ws;
     private CancellationTokenSource _cts;
     private Uri _uri;
-    private volatile bool bConnected;    
-    private readonly StringBuilder _userTranscript  = new();                // text/ASR    
-    private readonly byte[] _recvBuffer             = new byte[1 << 16];    // buffers 64KB    
-    private volatile bool bResponseInFlight;                                // response lifecycle (simple)
+    private volatile bool bConnected;
+    private readonly StringBuilder _userTranscript  = new();                    // text/ASR    
+    private readonly byte[] _recvBuffer             = new byte[1 << 16];        // buffers 64KB    
+    private volatile bool bResponseInFlight;                                    // response lifecycle (simple)
+    private TimeSpan receiveIdleTimeout             = TimeSpan.FromSeconds(90); // 90秒來判定是否為殭屍連線
 
     // 保證 SendAsync 串行化
-    private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private readonly SemaphoreSlim _sendLock        = new(1, 1);
 
     // 把背景執行緒事件丟回主執行緒
     private readonly ConcurrentQueue<Action> _mainThreadActions = new();
@@ -56,6 +64,7 @@ public class OpenAIRealtime : IDisposable
     public event Action<string> OnAssistantTextDone;
     public event Action<byte[]> OnAssistantAudioDelta;
     public event Action<byte[]> OnAssistantAudioDone;
+    public event Action<DebugLevel, string> OnLoggingDone;
     private bool bEventAsync = false;
 
     // ===============================
@@ -87,29 +96,33 @@ public class OpenAIRealtime : IDisposable
         try
         {
             // 最後一道防線：盡量避免在 UI/主緒卡住
-            DisposeAsync().ConfigureAwait(false).GetAwaiter().GetResult();
+            CloseAsync("Close Dispose").ConfigureAwait(false).GetAwaiter().GetResult();
         }
         catch { /* 最終防呆，避免例外往外拋 */ }
     }
 
-    public async Task DisposeAsync()
+    public async Task CloseAsync(string reason, bool bForce = false)
     {
         if (bDisposed) return;
 
         // 停新活
         bConnected = false;
 
-        // 1) 先發取消，讓所有 await 能中斷
-        try { _cts?.Cancel(); } catch { }
-
-        // 2) 等 ReceiveLoop 結束（避免 race）
-        try
+        // 不等待接收結束 直接強制關閉
+        if (!bForce)
         {
-            if (recvTask != null)
-                await recvTask.ConfigureAwait(false);
+            // 1) 先發取消，讓所有 await 能中斷
+            try { _cts?.Cancel(); } catch { }
+
+            // 2) 等 ReceiveLoop 結束（避免 race）
+            try
+            {
+                if (recvTask != null)
+                    await recvTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { /* 正常 */ }
+            catch (Exception ex) { EmitOnMain(() => OnLoggingDone?.Invoke(DebugLevel.Warning, $"Recv loop ended with: {ex.Message}")); }
         }
-        catch (OperationCanceledException) { /* 正常 */ }
-        catch (Exception ex) { Console.WriteLine($"[Warning] recv loop ended with: {ex.Message}"); }
 
         // 3) 禮貌關閉（帶 timeout 避免無限卡住）
         try
@@ -118,7 +131,7 @@ public class OpenAIRealtime : IDisposable
             {
                 using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
 
-                await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", closeCts.Token).ConfigureAwait(false);
+                await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, reason, closeCts.Token).ConfigureAwait(false);
             }
         }
         catch { }
@@ -129,7 +142,7 @@ public class OpenAIRealtime : IDisposable
 
             _cts?.Dispose();
             _cts = null;
-        }        
+        }
     }
 
     // ===============================
@@ -144,7 +157,7 @@ public class OpenAIRealtime : IDisposable
         _ws.Options.SetRequestHeader("Authorization", $"Bearer {openAIApiKey}");
         _ws.Options.SetRequestHeader("OpenAI-Beta", "realtime=v1");
 
-        _cts    = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
         try
         {
@@ -153,8 +166,8 @@ public class OpenAIRealtime : IDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Error] Realtime connect failed: {ex.Message}");
-            bConnected = false; 
+            EmitOnMain(() => OnLoggingDone?.Invoke(DebugLevel.Error, $"Realtime connect failed: {ex.Message}"));
+            bConnected = false;
         }
 
         if (bConnected)
@@ -180,7 +193,19 @@ public class OpenAIRealtime : IDisposable
                 }
             });
 
-            recvTask = ReceiveLoop();
+            try
+            {
+                recvTask = ReceiveLoop();
+            }
+            catch (TimeoutException)
+            {
+                EmitOnMain(() => OnLoggingDone(DebugLevel.Warning, "No frames received within timeout; close as zombie."));
+                await CloseAsync("idle-timeout", true).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                EmitOnMain(() => OnLoggingDone(DebugLevel.Warning, $"Receive error: {ex.Message}"));
+            }
         }
 
         return bConnected;
@@ -229,12 +254,12 @@ public class OpenAIRealtime : IDisposable
         await TruncateAsync(playedMsSoFar).ConfigureAwait(false);
 
         // 3) 本地丟棄舊 item 的後續 delta
-        _squelchItemId = _activeAssistantItemId;                              
+        _squelchItemId = _activeAssistantItemId;
 
         // 4) 清空本地播放緩衝，避免播放殘留
         //EmitOnMain(() => OnAssistantAudioDelta?.Invoke(Array.Empty<byte>()));
 
-        Console.WriteLine($"[Log] Barge-in triggered at {playedMsSoFar} ms");
+        EmitOnMain(() => OnLoggingDone(DebugLevel.Log, $"Barge-in triggered at {playedMsSoFar} ms"));
     }
 
     public async Task SendTextAsync(string inst)
@@ -244,10 +269,10 @@ public class OpenAIRealtime : IDisposable
             return;
         }
 
-        var create              = new
+        var create = new
         {
-            type                = "response.create",
-            response            = new
+            type        = "response.create",
+            response    = new
             {
                 modalities      = new[] { "text", "audio" },
                 instructions    = inst
@@ -277,7 +302,7 @@ public class OpenAIRealtime : IDisposable
             }
         }
         catch (OperationCanceledException) { /* ignore on shutdown */ }
-        catch (WebSocketException wse) { Console.WriteLine($"[Warning] Send error: {wse.Message}"); }
+        catch (WebSocketException wse) { EmitOnMain(() => OnLoggingDone(DebugLevel.Warning, $"Send error: {wse.Message}")); }
         finally
         {
             _sendLock.Release();
@@ -299,11 +324,11 @@ public class OpenAIRealtime : IDisposable
             {
                 do
                 {
-                    res = await _ws.ReceiveAsync(new ArraySegment<byte>(_recvBuffer), _cts.Token);
+                    res = await ReceiveOnceWithTimeout(receiveIdleTimeout);
                     if (res.MessageType == WebSocketMessageType.Close)
                     {
-                        Console.WriteLine($"[Warning] Realtime closed: {res.CloseStatus} {res.CloseStatusDescription}");
-                        bConnected = false; 
+                        EmitOnMain(() => OnLoggingDone(DebugLevel.Warning, $"Realtime closed: {res.CloseStatus} {res.CloseStatusDescription}"));
+                        bConnected = false;
                         break;
                     }
                     sb.Append(Encoding.UTF8.GetString(_recvBuffer, 0, res.Count));
@@ -312,7 +337,7 @@ public class OpenAIRealtime : IDisposable
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Warning] Receive error: {ex.Message}");
+                EmitOnMain(() => OnLoggingDone(DebugLevel.Warning, $"Receive error: {ex.Message}"));
                 break;
             }
 
@@ -342,7 +367,7 @@ public class OpenAIRealtime : IDisposable
         try { jo = JObject.Parse(jsonLine); }
         catch
         {
-            if (jsonLine.Contains("\"error\"")) Console.WriteLine($"[Error] SERVER ERROR (raw): {jsonLine}");
+            if (jsonLine.Contains("\"error\"")) EmitOnMain(() => OnLoggingDone(DebugLevel.Error, $"SERVER ERROR (raw): {jsonLine}"));
             return;
         }
 
@@ -383,13 +408,13 @@ public class OpenAIRealtime : IDisposable
                     {
                         textBuilder.Append(d);
                     }
-                    
+
                     string txt = textBuilder.ToString();
                     if (!string.IsNullOrEmpty(txt))
                     {
                         EmitOnMain(() => OnAssistantTextDelta?.Invoke(txt));
                     }
-                    Console.WriteLine($"[Log] ASSISTANT TEXT DELTA: {txt}");
+                    EmitOnMain(() => OnLoggingDone(DebugLevel.Log, $"ASSISTANT TEXT DELTA: {txt}"));
 
                     return;
                 }
@@ -402,7 +427,7 @@ public class OpenAIRealtime : IDisposable
                     {
                         EmitOnMain(() => OnAssistantTextDone?.Invoke(txt));
                     }
-                    Console.WriteLine($"[Log] ASSISTANT TEXT: {txt}");
+                    EmitOnMain(() => OnLoggingDone(DebugLevel.Log, $"ASSISTANT TEXT: {txt}"));
                     textBuilder.Clear();
                     return;
                 }
@@ -430,11 +455,11 @@ public class OpenAIRealtime : IDisposable
 
                     try
                     {
-                        var bytes       = Convert.FromBase64String(b64);
-                        
+                        var bytes = Convert.FromBase64String(b64);
+
                         EmitOnMain(() => OnAssistantAudioDelta?.Invoke(bytes));
                     }
-                    catch (Exception e) { Console.WriteLine($"[Warning] Audio delta decode error: {e.Message}"); }
+                    catch (Exception e) { EmitOnMain(() => OnLoggingDone(DebugLevel.Warning, $"Audio delta decode error: {e.Message}")); }
                     return;
                 }
             case "response.output_audio.done":
@@ -464,8 +489,8 @@ public class OpenAIRealtime : IDisposable
                         // 建立回應 + 指令
                         _ = SendAsync(new
                         {
-                            type        = "response.create",
-                            response    = new
+                            type = "response.create",
+                            response = new
                             {
                                 instructions = basicInstructions
                             }
@@ -479,7 +504,7 @@ public class OpenAIRealtime : IDisposable
                 {
                     string code = (string)jo["error"]?["code"];
                     string msg  = (string)jo["error"]?["message"];
-                    Console.WriteLine($"[Error] SERVER ERROR: code={code}, message={msg}\n{jsonLine}");
+                    EmitOnMain(() => OnLoggingDone(DebugLevel.Error, $"SERVER ERROR: code={code}, message={msg}\n{jsonLine}"));
                     return;
                 }
 
@@ -493,7 +518,7 @@ public class OpenAIRealtime : IDisposable
     {
         if (action == null) return;
 
-        if(bEventAsync)
+        if (bEventAsync)
         {
             _mainThreadActions.Enqueue(action);
         }
@@ -506,5 +531,22 @@ public class OpenAIRealtime : IDisposable
     public bool IsConnected()
     {
         return _ws != null && _ws.State == WebSocketState.Open && bConnected;
+    }
+    private async Task<WebSocketReceiveResult> ReceiveOnceWithTimeout(TimeSpan timeout)
+    {
+        using var perReceiveCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+
+        var recvTask            = _ws.ReceiveAsync(new ArraySegment<byte>(_recvBuffer), perReceiveCts.Token);
+        var delayTask           = Task.Delay(timeout, _cts.Token);
+        var finished            = await Task.WhenAny(recvTask, delayTask).ConfigureAwait(false);
+
+        if (finished != recvTask)
+        {
+            // 逾時只取消「這次接收」，不影響整體連線
+            perReceiveCts.Cancel();
+            throw new TimeoutException("Receive idle-timeout.");
+        }
+
+        return await recvTask.ConfigureAwait(false);
     }
 }

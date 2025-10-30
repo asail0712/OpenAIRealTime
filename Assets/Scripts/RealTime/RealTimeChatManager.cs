@@ -72,11 +72,11 @@ public class RealTimeChatManager : MonoBehaviour
     // ===============================
     // Internals - RX/playback
     // ===============================
-    private readonly ConcurrentQueue<float> _rxQueue = new ConcurrentQueue<float>(); // 24k mono float
-    private int _srcSampleRate = 24000;  // model output when pcm16
-    private int _dspSampleRate = 48000;  // audio device output
-    private float _holdSample;           // for 24k→48k duplication
-    private int _dupState;               // 0/1 alternating
+    private readonly ConcurrentQueue<float> _rxQueue    = new ConcurrentQueue<float>(); // 24k mono float
+    private int _srcSampleRate                          = 24000;    // model output when pcm16
+    private int _dspSampleRate                          = 48000;    // audio device output
+    private float _holdSample;                                      // for 24k→48k duplication
+    private int _dupState;                                          // 0/1 alternating
 
     // temp buffers
     private float[] _floatBuf   = Array.Empty<float>(); // multi-channel
@@ -131,6 +131,8 @@ public class RealTimeChatManager : MonoBehaviour
         aiRealtime.OnAssistantAudioDelta    += HandleAIAudio;
         // 連線/工作階段狀態（可選）
         //aiRealtimeUnity.OnSessionStateChanged += HandleSessionStateChanged;             // TODO: Action<string>
+        // OpenAI Log資訊
+        aiRealtime.OnLoggingDone += HandleAILog;
     }
 
     private void OnDisable()
@@ -140,7 +142,8 @@ public class RealTimeChatManager : MonoBehaviour
         aiRealtime.OnResposeFinish              -= HandleAIResposeFinish;
         aiRealtime.OnAssistantTextDelta         -= HandleAITranscript;
         aiRealtime.OnAssistantAudioDelta        -= HandleAIAudio;
-        //aiRealtimeUnity.OnSessionStateChanged -= HandleSessionStateChanged;
+        //aiRealtimeUnity.OnSessionStateChanged -= HandleSessionStateChanged;        
+        aiRealtime.OnLoggingDone                -= HandleAILog;
     }
 
     private async void Start()
@@ -159,7 +162,7 @@ public class RealTimeChatManager : MonoBehaviour
         aiRealtime.Update();
     }
 
-    private async void OnDestroy()
+    private void OnDestroy()
     {
         try
         {
@@ -268,12 +271,28 @@ public class RealTimeChatManager : MonoBehaviour
         }
     }
 
+    private void HandleAILog(DebugLevel lv, string logStr)
+    {
+        switch (lv)
+        {
+            case DebugLevel.Log:
+                Debug.Log(logStr);
+                break;
+            case DebugLevel.Warning:
+                Debug.LogWarning(logStr);
+                break;
+            case DebugLevel.Error:
+                Debug.LogError(logStr);
+                break;
+        }
+    }
+
     // =============== Helpers ===============
-    
+
     // ===============================
     // Mic controls
     // ===============================
-    
+
     private void StartRecord()
     {
         MicStartButton();                                      // TODO
