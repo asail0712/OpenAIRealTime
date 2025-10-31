@@ -63,7 +63,7 @@ public class OpenAIRealtime : IDisposable
     public event Action<string> OnAssistantTextDelta;
     public event Action<string> OnAssistantTextDone;
     public event Action<byte[]> OnAssistantAudioDelta;
-    public event Action<byte[]> OnAssistantAudioDone;
+    public event Action OnAssistantAudioDone;
     public event Action<DebugLevel, string> OnLoggingDone;
     private bool bEventAsync = false;
 
@@ -464,7 +464,7 @@ public class OpenAIRealtime : IDisposable
                 }
             case "response.output_audio.done":
                 {
-                    EmitOnMain(() => OnAssistantAudioDone?.Invoke(Array.Empty<byte>()));
+                    EmitOnMain(() => OnAssistantAudioDone?.Invoke());
                     return;
                 }
 
