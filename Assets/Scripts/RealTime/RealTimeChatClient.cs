@@ -22,19 +22,17 @@ public static class AudioMsgTypes
     public const string ReceiveText         = "audio.ReceiveText";      // server -> client
 }
 
+// 依照Server定義決定
 public class AIMessage
 {
-    public string Type { get; set; } = string.Empty;
-
-    // Base64 編碼的 PCM16 音訊資料 或是文字資料
-    public object? Payload { get; set; } = null;
+    public string Type { get; set; }        = string.Empty;    
+    public object? Payload { get; set; }    = null; // Base64 編碼的 PCM16 音訊資料 或是文字資料
 }
 
 
 public class RealTimeChatClient : MonoBehaviour
 {
     [Header("Wiring")]
-    [SerializeField] private Text userText; // 顯示使用者語音轉文字(含逐字&最終)
     [SerializeField] private Text aiText;   // 顯示 AI 回覆(含逐字&最終)
     [SerializeField] private Button micBtn; // 點擊=切換；長按=Push-To-Talk
 
@@ -42,7 +40,6 @@ public class RealTimeChatClient : MonoBehaviour
     public string microphoneDevice = string.Empty; // 麥克風 (2- Usb Audio Device)
 
     [Header("Optional: Typed input(非必接)")]
-    [SerializeField] private InputField typedInput; // 若你有打字輸入就接上
     [SerializeField] private Button interruptAIBtn;
 
     [Header("Playback")]
@@ -56,8 +53,7 @@ public class RealTimeChatClient : MonoBehaviour
     [Range(0.05f, 0.5f)] public float sendChunkSeconds = 0.25f; // 250ms
 
     // Send loop flags
-    private volatile bool _streamingMic;
-    public bool IsMicOn { get => _streamingMic; }
+    private volatile bool bStreamingMic;
 
     // ===============================
     // Internals - Mic capture/send
@@ -80,9 +76,6 @@ public class RealTimeChatClient : MonoBehaviour
     private float[] _floatBuf   = Array.Empty<float>(); // multi-channel
     private float[] _monoBuf    = Array.Empty<float>();  // mono
     private byte[] _pcmBuf      = Array.Empty<byte>();   // PCM16 mono
-
-    // 內部狀態
-    private bool pushToTalkHeld = false;
 
     // ===============================
     // WS Client
@@ -136,7 +129,6 @@ public class RealTimeChatClient : MonoBehaviour
     private async void Start()
     {
         // 啟動時保險：把顯示清空
-        if (userText) userText.text = "";
         if (aiText) aiText.text = "";
 
         RefreshMicUI();
@@ -147,12 +139,6 @@ public class RealTimeChatClient : MonoBehaviour
 
     private void OnDestroy()
     {
-        try
-        {
-            _streamingMic = false;
-        }
-        catch { }
-
         if (_micClip != null && Microphone.IsRecording(microphoneDevice))
         {
             Microphone.End(microphoneDevice);
@@ -176,22 +162,10 @@ public class RealTimeChatClient : MonoBehaviour
     // 點一下：切換持續收音
     private void OnMicClicked()
     {
-        if (IsMicOn)
+        if (bStreamingMic)
             StopRecord();
         else
             StartRecord();
-    }
-
-    // 長按（Push-To-Talk）：可在 EventTrigger 綁定 PointerDown/PointerUp
-    public void OnMicPointerDown()
-    {
-        pushToTalkHeld = true;
-        if (!IsMicOn) StartRecord();
-    }
-    public void OnMicPointerUp()
-    {
-        pushToTalkHeld = false;
-        if (IsMicOn) StopRecord();
     }
 
     // =============== interrupt ai talk ================
@@ -282,22 +256,14 @@ public class RealTimeChatClient : MonoBehaviour
         var label = micBtn.GetComponentInChildren<Text>();
         if (label != null)
         {
-            if (pushToTalkHeld) label.text = "PTT…(鬆開停止)";
-            else if (IsMicOn) label.text = "收音中…(點擊關)";
-            else label.text = "按下說話";
+            if (bStreamingMic) 
+                label.text = "收音中…(點擊關)";
+            else 
+                label.text = "按下說話";
         }
 
         // 視覺狀態（可自訂色塊/動畫）
         micBtn.interactable = true;
-    }
-
-    private async Task SafeCall(Func<Task> fn)
-    {
-        try { await fn(); }
-        catch (Exception e)
-        {
-            Debug.LogError($"[RealTimeChatManager] {e.Message}\n{e.StackTrace}");
-        }
     }
 
     [ContextMenu("MIC: Start")]
@@ -310,7 +276,7 @@ public class RealTimeChatClient : MonoBehaviour
     [ContextMenu("MIC: Stop")]
     public void MicStopButton()
     {
-        _streamingMic = false;
+        bStreamingMic = false;
         if (_micClip != null && Microphone.IsRecording(microphoneDevice))
         {
             Microphone.End(microphoneDevice);
@@ -345,8 +311,9 @@ public class RealTimeChatClient : MonoBehaviour
         _monoBuf        = new float[1];
         _pcmBuf         = new byte[1];
 
+        bStreamingMic   = true;
+
         playbackSource.Play();
-        _streamingMic   = true;
 
         Debug.Log($"[Mic] Device={microphoneDevice}, reqRate={sampleRate}, actualRate={_micClip.frequency}, samples={_clipSamples}, ch={_clipChannels}");
     }
@@ -385,7 +352,7 @@ public class RealTimeChatClient : MonoBehaviour
             await Task.Delay(10);
         }
 
-        while (_streamingMic && IsConnected())
+        while (bStreamingMic && IsConnected())
         {
             int micPos      = Microphone.GetPosition(microphoneDevice);
             if (micPos < 0)
@@ -463,8 +430,6 @@ public class RealTimeChatClient : MonoBehaviour
                 _pcmBuf[b]      = (byte)(s & 0xFF);
                 _pcmBuf[b + 1]  = (byte)((s >> 8) & 0xFF);
             }
-
-            // 做vad判斷
 
             string b64  = Convert.ToBase64String(_pcmBuf, 0, byteCount);
             _micReadPos = (_micReadPos + toSend) % _clipSamples;
