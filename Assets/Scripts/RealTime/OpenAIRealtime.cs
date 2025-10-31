@@ -101,7 +101,7 @@ public class OpenAIRealtime : IDisposable
         catch { /* 最終防呆，避免例外往外拋 */ }
     }
 
-    public async Task CloseAsync(string reason, bool bForce = false)
+    private async Task CloseAsync(string reason, bool bForce = false)
     {
         if (bDisposed) return;
 
