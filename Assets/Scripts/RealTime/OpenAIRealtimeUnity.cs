@@ -40,10 +40,8 @@ public class OpenAIRealtimeUnity : MonoBehaviour
 
     private void Update()
     {
-        while(deltaMessage != null || deltaMessage.Count > 0)
+        while(deltaMessage.TryDequeue(out var msg))
         {
-            string msg = deltaMessage.Dequeue();
-
             finishAction?.Invoke(msg);
         }
     }
