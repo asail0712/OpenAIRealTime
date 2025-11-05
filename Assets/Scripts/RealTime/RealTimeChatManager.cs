@@ -8,6 +8,8 @@ using UnityEngine;
 using UnityEngine.Audio;
 using UnityEngine.UI;
 
+using XPlan.OpenAI;
+
 public class RealTimeChatManager : MonoBehaviour
 {
     // ===============================

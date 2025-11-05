@@ -10,6 +10,8 @@ using UnityEngine;
 using UnityEngine.Audio;
 using UnityEngine.UI;
 
+using XPlan.OpenAI;
+
 public static class AudioMsgTypes
 {
     public const string Start               = "audio.Start";            // server -> client
@@ -431,11 +433,11 @@ public class RealTimeChatClient : MonoBehaviour
                 _pcmBuf[b + 1]  = (byte)((s >> 8) & 0xFF);
             }
 
-            string b64  = Convert.ToBase64String(_pcmBuf, 0, byteCount);
+            //string b64  = Convert.ToBase64String(_pcmBuf, 0, byteCount);
             _micReadPos = (_micReadPos + toSend) % _clipSamples;
 
             // 送到後端 WebSocket
-            await SendAudioBase64Async(b64);
+            await SendAudioAsync(_pcmBuf, byteCount);
         }
     }
 
@@ -620,29 +622,16 @@ public class RealTimeChatClient : MonoBehaviour
         }
     }
 
-    private async Task SendAsync(object payload)
+    private async Task SendAsync(ArraySegment<byte> seg, WebSocketMessageType type)
     {
         if (!IsConnected()) return;
-
-        string json;
-        try
-        {
-            json = JsonConvert.SerializeObject(payload);
-        }
-        catch (Exception ex)
-        {
-            Debug.LogWarning($"[WS] Serialize error: {ex.Message}");
-            return;
-        }
-
-        var bytes = Encoding.UTF8.GetBytes(json);
 
         //await _sendLock.WaitAsync(_cts.Token).ConfigureAwait(false);
         try
         {
             if (IsConnected() && !_cts.IsCancellationRequested)
             {
-                await _ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, _cts.Token).ConfigureAwait(false);
+                await _ws.SendAsync(seg, type, true, _cts.Token).ConfigureAwait(false);
             }
         }
         catch (Exception ex)
@@ -655,15 +644,35 @@ public class RealTimeChatClient : MonoBehaviour
         }
     }
 
-    public Task SendAudioBase64Async(string b64)
+    public Task SendAudioAsync(byte[] buffer, int count)
     {
-        var msg = new AIMessage { Type = AudioMsgTypes.Send, Payload = b64 };
-        return SendAsync(msg);
+        if (buffer == null || count <= 0) return Task.CompletedTask;
+        return SendAsync(new ArraySegment<byte>(buffer, 0, count), WebSocketMessageType.Binary);
     }
 
-    public Task SendInterruptAsync()
+    public async Task SendInterruptAsync()
     {
-        var msg = new AIMessage { Type = AudioMsgTypes.InterruptReceive, Payload = "" };
-        return SendAsync(msg);
+        try
+        {
+            var msg = new AIMessage { Type = AudioMsgTypes.InterruptReceive, Payload = "" };
+            string json;
+            try
+            {
+                json = JsonConvert.SerializeObject(msg);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[WS] Serialize error: {ex.Message}");
+                return;
+            }
+
+            var bytes = Encoding.UTF8.GetBytes(json);
+
+            await SendAsync(bytes, WebSocketMessageType.Text);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[WS] Serialize error: {ex.Message}");
+        }
     }
 }
