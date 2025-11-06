@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Unity.Burst.Intrinsics;
 using UnityEngine;
@@ -64,6 +65,14 @@ public class RealTimeChatClient : MonoBehaviour
     private int _micReadPos;
     private int _clipSamples;
     private int _clipChannels;
+
+    // ===============================
+    // Internals - 音訊轉byte[]
+    // ===============================
+    private Channel<byte[]> _txChan;
+    private const int TxFrameMinMs  = 20;   // 20–40ms
+    private const int TxFrameMaxMs  = 40;
+    private int _bytesPerMs         => (sampleRate /* 24000 */ * 2 /*pcm16*/ ) / 1000;
 
     // ===============================
     // Internals - RX/playback
@@ -151,6 +160,36 @@ public class RealTimeChatClient : MonoBehaviour
         try { _cts?.Cancel(); } catch { }
         try { _ws?.Abort(); } catch { }
         try { _ws?.Dispose(); } catch { }
+    }
+
+    // ===== 在 ConnectAsync 成功後 or Awake/Start 初始化 =====
+    private void InitTxChannel()
+    {
+        // 32 個 frame 緩衝，約 0.64~1.28 秒（以 20~40ms 計）
+        _txChan = Channel.CreateBounded<byte[]>(
+            new BoundedChannelOptions(32)
+            {
+                SingleReader    = true,
+                SingleWriter    = true,
+                FullMode        = BoundedChannelFullMode.DropOldest // 核心：滿載丟最舊
+            });
+
+        // 專責送出者（單 reader）
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // 持續讀取_txChan 若是讀到資料就送出
+                await foreach (var frame in _txChan.Reader.ReadAllAsync(_cts.Token))
+                {
+                    await SendAsync(new ArraySegment<byte>(frame, 0, frame.Length),
+                                    WebSocketMessageType.Binary)
+                          .ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) { /* 正常關閉 */ }
+            catch (Exception ex) { Debug.LogWarning($"[TX] Sender error: {ex.Message}"); }
+        });
     }
 
     private void OnAudioConfigChanged(bool deviceWasChanged)
@@ -341,7 +380,14 @@ public class RealTimeChatClient : MonoBehaviour
         _monoBuf    = new float[chunkSamples];
         _pcmBuf     = new byte[chunkSamples * 2];
 
-        // warm up: wait until ~150ms data is available
+        // 建立累積器（byte）來 coalesce 微片段
+        var pending     = new byte[8192];
+        int pendingLen  = 0;
+
+        int minBytes    = _bytesPerMs * TxFrameMinMs; // 20ms = 960 bytes @24k
+        int maxBytes    = _bytesPerMs * TxFrameMaxMs; // 40ms = 1920 bytes @24k
+
+        // 暖機.. 等累積到固定時間(0.15s) 再去讀取資料
         int warmupNeeded = (int)(effectiveRate * 0.15f);
 
         while (true)
@@ -354,6 +400,7 @@ public class RealTimeChatClient : MonoBehaviour
             await Task.Delay(10);
         }
 
+        // 開始讀取麥克風資料
         while (bStreamingMic && IsConnected())
         {
             int micPos      = Microphone.GetPosition(microphoneDevice);
@@ -362,6 +409,7 @@ public class RealTimeChatClient : MonoBehaviour
                 await Task.Yield(); continue;
             }
 
+            // 因為是使用環形buff 所以用來計算可用樣本數、決定本次要讀多少
             int available   = (_micReadPos <= micPos) ? (micPos - _micReadPos) : (micPos + _clipSamples - _micReadPos);
             int toSend      = Mathf.Min(available, chunkSamples);
             if (toSend <= 0)
@@ -369,13 +417,15 @@ public class RealTimeChatClient : MonoBehaviour
                 await Task.Delay(8); continue;
             }
 
-            // read (handle wrap)
+            // 準備一次要讀的 buffer
+            // 乘上_clipChannels是考慮多聲道
             int neededFloats = toSend * _clipChannels;
             if (_floatBuf.Length != neededFloats)
             {
                 _floatBuf = new float[neededFloats];
             }
 
+            // 從環形音訊中取出資料，含「不繞」與「繞尾」兩種情況
             if (_micReadPos + toSend <= _clipSamples)
             {
                 _micClip.GetData(_floatBuf, _micReadPos);
@@ -394,7 +444,7 @@ public class RealTimeChatClient : MonoBehaviour
                 Array.Copy(b, 0, _floatBuf, a.Length, b.Length);
             }
 
-            // downmix → mono
+            // downmix → mono 把多聲道壓成單聲道
             if (_monoBuf.Length < toSend)
             {
                 _monoBuf = new float[toSend];
@@ -418,6 +468,7 @@ public class RealTimeChatClient : MonoBehaviour
             }
 
             // float [-1,1] → PCM16 LE
+            // 每個 sample 在 16-bit PCM 中占 2 bytes (16 bits)
             int byteCount = toSend * 2;
 
             if (_pcmBuf.Length < byteCount)
@@ -433,11 +484,45 @@ public class RealTimeChatClient : MonoBehaviour
                 _pcmBuf[b + 1]  = (byte)((s >> 8) & 0xFF);
             }
 
-            //string b64  = Convert.ToBase64String(_pcmBuf, 0, byteCount);
+            // 更新讀取指標（環形前進）
             _micReadPos = (_micReadPos + toSend) % _clipSamples;
 
-            // 送到後端 WebSocket
-            await SendAudioAsync(_pcmBuf, byteCount);
+            // 累積資料到 pending（自動擴容）
+            if (pendingLen + byteCount > pending.Length)
+            {
+                Array.Resize(ref pending, Math.Max(pending.Length * 2, pendingLen + byteCount));
+            }
+
+            Buffer.BlockCopy(_pcmBuf, 0, pending, pendingLen, byteCount);
+            pendingLen += byteCount;
+
+            // 若不足 20ms，繼續累積（也避免 <10ms 的碎片被送出）
+            if (pendingLen < minBytes)
+            {
+                continue;
+            }
+
+            // 一次可以切到 20~40ms 的塊丟進 channel
+            while (pendingLen >= minBytes)
+            {
+                int sendBytes   = Math.Min(pendingLen, maxBytes);
+                var frame       = new byte[sendBytes];
+                Buffer.BlockCopy(pending, 0, frame, 0, sendBytes);
+
+                // 丟進 bounded channel（滿了會自動丟最舊）
+                // TryWrite 幾乎總是成功；若偶爾失敗，用 WriteAsync 也可
+                if (!_txChan.Writer.TryWrite(frame))
+                    await _txChan.Writer.WriteAsync(frame, _cts.Token);
+
+                // 左移剩餘
+                int left = pendingLen - sendBytes;
+                if (left > 0)
+                    Buffer.BlockCopy(pending, sendBytes, pending, 0, left);
+                pendingLen = left;
+
+                // 若剩下 <10ms，就繼續累積，不再細碎送
+                if (pendingLen < _bytesPerMs * 10) break;
+            }
         }
     }
 
@@ -505,6 +590,8 @@ public class RealTimeChatClient : MonoBehaviour
 
             // 啟動收訊循環
             _ = Task.Run(ReceiveLoopAsync);
+
+            InitTxChannel();
         }
         catch (Exception ex)
         {
