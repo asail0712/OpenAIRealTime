@@ -6,9 +6,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
-using Unity.Burst.Intrinsics;
 using UnityEngine;
-using UnityEngine.Audio;
 using UnityEngine.UI;
 
 using XPlan.OpenAI;
@@ -51,9 +49,6 @@ public class RealTimeChatClient : MonoBehaviour
     [Header("Audio Settings")]
     [Tooltip("Preferred sample rate for mic capture. Actual mic rate comes from _micClip.frequency.")]
     public int sampleRate = 24000;
-
-    [Tooltip("Seconds per chunk when sending mic audio frames.")]
-    [Range(0.05f, 0.5f)] public float sendChunkSeconds = 0.25f; // 250ms
 
     // Send loop flags
     private volatile bool bStreamingMic;
@@ -374,11 +369,6 @@ public class RealTimeChatClient : MonoBehaviour
         }
 
         int effectiveRate   = (_micClip.frequency > 0) ? _micClip.frequency : sampleRate;
-        int chunkSamples    = Mathf.Max(1, (int)(sendChunkSeconds * effectiveRate));
-
-        _floatBuf   = new float[chunkSamples * _clipChannels];
-        _monoBuf    = new float[chunkSamples];
-        _pcmBuf     = new byte[chunkSamples * 2];
 
         // 建立累積器（byte）來 coalesce 微片段
         var pending     = new byte[8192];
@@ -410,8 +400,7 @@ public class RealTimeChatClient : MonoBehaviour
             }
 
             // 因為是使用環形buff 所以用來計算可用樣本數、決定本次要讀多少
-            int available   = (_micReadPos <= micPos) ? (micPos - _micReadPos) : (micPos + _clipSamples - _micReadPos);
-            int toSend      = Mathf.Min(available, chunkSamples);
+            int toSend = (_micReadPos <= micPos) ? (micPos - _micReadPos) : (micPos + _clipSamples - _micReadPos);
             if (toSend <= 0)
             {
                 await Task.Delay(8); continue;
@@ -420,7 +409,7 @@ public class RealTimeChatClient : MonoBehaviour
             // 準備一次要讀的 buffer
             // 乘上_clipChannels是考慮多聲道
             int neededFloats = toSend * _clipChannels;
-            if (_floatBuf.Length != neededFloats)
+            if (_floatBuf == null || _floatBuf.Length != neededFloats)
             {
                 _floatBuf = new float[neededFloats];
             }
@@ -445,7 +434,7 @@ public class RealTimeChatClient : MonoBehaviour
             }
 
             // downmix → mono 把多聲道壓成單聲道
-            if (_monoBuf.Length < toSend)
+            if (_monoBuf == null || _monoBuf.Length < toSend)
             {
                 _monoBuf = new float[toSend];
             }
@@ -471,7 +460,7 @@ public class RealTimeChatClient : MonoBehaviour
             // 每個 sample 在 16-bit PCM 中占 2 bytes (16 bits)
             int byteCount = toSend * 2;
 
-            if (_pcmBuf.Length < byteCount)
+            if (_pcmBuf == null || _pcmBuf.Length < byteCount)
             {
                 _pcmBuf = new byte[byteCount];
             }
