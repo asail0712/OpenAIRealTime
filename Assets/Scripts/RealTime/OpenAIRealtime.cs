@@ -251,24 +251,39 @@ namespace XPlan.OpenAI
             EmitOnMain(() => OnLoggingDone?.Invoke(DebugLevel.Log, $"Barge-in triggered at {playedMsSoFar} ms"));
         }
 
-        public async Task SendTextAsync(string inst)
+        public async Task SendTextAsync(string text, bool wantAudio = true)
         {
-            if (!bConnected)
-            {
-                return;
-            }
+            if (!bConnected || string.IsNullOrWhiteSpace(text)) return;
 
-            var create = new
+            // 1) 先把使用者訊息加進「當前會話」
+            await SendAsync(new
+            {
+                type = "conversation.item.create",
+                item = new
+                {
+                    type        = "message",
+                    role        = "user",
+                    content     = new object[]
+                    {
+                        new 
+                        { 
+                            type = "input_text", 
+                            text = text 
+                        }
+                    }
+                }
+            });
+
+            // 2) 要求模型產生回覆（可選：只文字，或同時文字+語音）
+            await SendAsync(new
             {
                 type        = "response.create",
                 response    = new
-                {
-                    modalities      = new[] { "text", "audio" },
-                    instructions    = inst
+                {                    
+                    modalities      = wantAudio ? new[] { "text", "audio" } : new[] { "text" }, // 想要同時拿文字+語音，用 new[] { "text", "audio" }；只要文字就 new[] { "text" }
+                    instructions    = basicInstructions                                         // 若你已經在 session.update 設好 instructions/voice，這裡可省略 instructions
                 }
-            };
-
-            await SendAsync(create);
+            });
         }
 
         public async Task SendAsync(object payload)
